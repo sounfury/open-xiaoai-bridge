@@ -1,6 +1,9 @@
 import asyncio
+import json
+import os
 import threading
 import time
+import wave
 
 import numpy as np
 import open_xiaoai_server
@@ -22,6 +25,19 @@ ASCII_BANNER = """
                                                                                                                 
 """
 
+# 音箱录音带播放回采（OwnDing 客户端的 echo_ref）：一个麦克风 + 回采声道。
+# OH2P 的 hw:0,3（共享名 Capture）4 声道，第 4 声道是播放回采。
+# 采样率必须是线上 16 kHz 的 3 倍；shift 是 S32 → S16 的右移位数。
+DEFAULT_ECHO_CAPTURE = {
+    "pcm": "Capture",
+    "channels": 4,
+    "sample_rate": 48000,
+    "mic_channel": 0,
+    "ref_channel": 3,
+    "mic_shift": 14,
+    "ref_shift": 16,
+}
+
 
 class XiaoAI:
     speaker = SpeakerManager()
@@ -30,6 +46,9 @@ class XiaoAI:
     conversation = XiaoAIConversationController()
     _input_gain_enabled = False
     _input_gain = 1.0
+    # 双声道录音里麦克风声道的电平比单声道录音低，乘这个倍数回到原来的电平
+    _echo_mic_gain = 64.0
+    _echo_dump: dict | None = None
     _async_loop_ready = threading.Event()
     _external_wakeup_keywords: set[str] = set()
     _muse_wakeup_keywords: set[str] = set()
@@ -126,6 +145,85 @@ class XiaoAI:
             logger.debug(
                 f"[XiaoAI] Failed to pause suppressed dialog {dialog_id}: {exc}"
             )
+
+    @classmethod
+    def on_input_packet(cls, packet):
+        """新客户端的录音帧：(PCM bytes, metadata JSON)。
+
+        双声道 [麦克风, 播放回采]（layout=mic_ref）时，阶段 1 只取麦克风声道，
+        回声消除在阶段 2 接入。
+        """
+        data, metadata = packet
+        try:
+            layout = json.loads(metadata).get("layout") if metadata else None
+        except (TypeError, ValueError, AttributeError):
+            layout = None
+        if layout == "mic_ref":
+            frames = np.frombuffer(data, dtype="<i2").reshape(-1, 2)
+            if cls._echo_dump is not None:
+                cls._append_echo_dump(frames)
+            mic = frames[:, 0].astype(np.float32) * cls._echo_mic_gain
+            data = np.clip(np.round(mic), -32768, 32767).astype(np.int16).tobytes()
+        cls.on_input_data(data)
+
+    @classmethod
+    def _setup_echo_reference(cls):
+        """barge_in.echo_reference 打开时，请音箱同时发回播放回采。"""
+        barge_in = cls.config_manager.get_app_config("barge_in", {}) or {}
+        enabled = bool(barge_in.get("echo_reference", False))
+        override = os.environ.get("BARGE_IN_ECHO_REFERENCE", "").strip().lower()
+        if override:
+            enabled = override in ("1", "true", "yes", "on")
+        if not enabled:
+            return
+        if not hasattr(open_xiaoai_server, "set_echo_ref"):
+            logger.warning("[XiaoAI] 原生扩展不支持 echo_ref，请重新编译 native")
+            return
+        capture = {**DEFAULT_ECHO_CAPTURE, **(barge_in.get("capture") or {})}
+        try:
+            cls._echo_mic_gain = float(barge_in.get("echo_mic_gain", 64))
+        except (TypeError, ValueError):
+            cls._echo_mic_gain = 64.0
+        open_xiaoai_server.set_echo_ref(json.dumps(capture))
+        logger.info(f"[XiaoAI] 🔁 请音箱同时发送播放回采: {capture}")
+
+        # 调试：ECHO_REF_DUMP=<文件.wav> 把开头若干秒的原始双声道录音存下来，用于确认回采声道
+        dump_path = os.environ.get("ECHO_REF_DUMP", "").strip()
+        if dump_path:
+            try:
+                seconds = float(os.environ.get("ECHO_REF_DUMP_SECONDS", "30"))
+            except ValueError:
+                seconds = 30.0
+            cls._echo_dump = {
+                "path": dump_path,
+                "max_frames": int(seconds * 16000),
+                "chunks": [],
+                "frames": 0,
+            }
+            logger.info(f"[XiaoAI] 将保存 {seconds:.0f}s 原始双声道录音到 {dump_path}")
+
+    @classmethod
+    def _append_echo_dump(cls, frames):
+        dump = cls._echo_dump
+        dump["chunks"].append(frames.copy())
+        dump["frames"] += len(frames)
+        if dump["frames"] < dump["max_frames"]:
+            return
+        cls._echo_dump = None
+        audio = np.concatenate(dump["chunks"])[: dump["max_frames"]]
+
+        def _write():
+            try:
+                with wave.open(dump["path"], "wb") as f:
+                    f.setnchannels(2)
+                    f.setsampwidth(2)
+                    f.setframerate(16000)
+                    f.writeframes(audio.astype("<i2").tobytes())
+                logger.info(f"[XiaoAI] 原始双声道录音已保存: {dump['path']}")
+            except Exception as exc:
+                logger.error(f"[XiaoAI] 保存双声道录音失败: {exc}")
+
+        threading.Thread(target=_write, daemon=True).start()
 
     @classmethod
     def on_input_data(cls, data: bytes):
@@ -325,7 +423,9 @@ class XiaoAI:
         cls.config_manager.add_reload_listener(cls.refresh_runtime_config)
         set_xiaoai(XiaoAI)
         GlobalStream.on_output_data = cls.on_output_data
+        cls._setup_echo_reference()
         open_xiaoai_server.register_fn("on_input_data", cls.on_input_data)
+        open_xiaoai_server.register_fn("on_input_packet", cls.on_input_packet)
         open_xiaoai_server.register_fn("on_event", cls.__on_event)
         cls.__init_background_event_loop()
         logger.info("[XiaoAI] 启动小爱音箱服务...")

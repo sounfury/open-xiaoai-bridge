@@ -225,6 +225,24 @@ APP_CONFIG = {
         # 进入 VAD/KWS/ASR 前放大麦克风输入；本机 OH2P 音量偏低，设为 1.0 可关闭。
         "gain": 4.0,
     },
+    "barge_in": {
+        # 让音箱同时发回正在播放的声音（[麦克风, 播放回采] 双声道），用于回声消除和播报中打断。
+        # 需要 OwnDing 版客户端（client-2026.10.09+）；只在 OH2P 上验证过。
+        # 阶段 1 只取麦克风声道，回声消除在阶段 2 接入。环境变量 BARGE_IN_ECHO_REFERENCE=1/0 可临时覆盖。
+        "echo_reference": False,
+        # 双声道里麦克风声道电平偏低，乘这个倍数回到单声道录音的电平（之后再乘 audio_input.gain）
+        "echo_mic_gain": 64,
+        # OH2P 的 hw:0,3（共享名 Capture）：4 声道 48 kHz，ch0 麦克风，ch3 播放回采
+        "capture": {
+            "pcm": "Capture",
+            "channels": 4,
+            "sample_rate": 48000,
+            "mic_channel": 0,
+            "ref_channel": 3,
+            "mic_shift": 14,
+            "ref_shift": 16,
+        },
+    },
     "asr": {
         # 支持 "sense_voice"（默认）、"paraformer"、"fire_red_asr" 或 "doubao"
         "model": "sense_voice",

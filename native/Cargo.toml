@@ -13,7 +13,10 @@ pyo3-async-runtimes = { version = "0.24", features = [
     "attributes",
     "tokio-runtime",
 ] }
-open-xiaoai = { git = "https://github.com/coderzc/open-xiaoai.git", branch = "main" }
+# OwnDing fork: binary stream frames, link timeouts, echo_ref capture.
+# Must match the client binary on the speaker (frame format). See
+# docs/ownding-migration-plan.md section 3.
+open-xiaoai = { git = "https://github.com/OwnDing/open-xiaoai.git", rev = "7ecea6fef330488676d48b2e954acfef9c0366ec" }
 tokio = { version = "1.32.0", features = ["full"] }
 tokio-tungstenite = "0.26.2"
 serde = { version = "1.0", features = ["derive"] }

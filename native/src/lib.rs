@@ -111,25 +111,31 @@ fn stop_recording(py: Python) -> PyResult<Bound<PyAny>> {
 }
 
 /// Restart the remote arecord process (unmutes the microphone).
+/// Carries `echo_ref` when set, so a restart keeps the stereo capture.
 #[pyfunction]
 fn start_recording(py: Python) -> PyResult<Bound<PyAny>> {
     pyo3_async_runtimes::tokio::future_into_py(py, async {
         let _ = RPC::instance()
-            .call_remote(
-                "start_recording",
-                Some(json!(AudioConfig {
-                    pcm: "noop".into(),
-                    channels: 1,
-                    bits_per_sample: 16,
-                    sample_rate: 16000,
-                    period_size: 1440 / 4,
-                    buffer_size: 1440,
-                })),
-                None,
-            )
+            .call_remote("start_recording", Some(server::recording_config()), None)
             .await;
         Ok(())
     })
+}
+
+/// JSON of the speaker's echo-reference capture, or "" for mono only.
+/// Takes effect with the next start_recording request.
+#[pyfunction]
+fn set_echo_ref(config: String) -> PyResult<()> {
+    let value = if config.trim().is_empty() {
+        None
+    } else {
+        Some(
+            serde_json::from_str(&config)
+                .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?,
+        )
+    };
+    server::set_echo_ref(value);
+    Ok(())
 }
 
 
@@ -143,6 +149,7 @@ fn open_xiaoai_server(_py: Python, m: Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(start_playing, &m)?)?;
     m.add_function(wrap_pyfunction!(stop_recording, &m)?)?;
     m.add_function(wrap_pyfunction!(start_recording, &m)?)?;
+    m.add_function(wrap_pyfunction!(set_echo_ref, &m)?)?;
     crate::opus::init_module(&m)?;
     crate::python::init_module(&m)?;
     crate::tts::init_module(&m)?;

@@ -32,6 +32,10 @@ impl PythonManager {
         Ok(())
     }
 
+    pub fn has_fn(&self, key: &str) -> bool {
+        self.functions.read().unwrap().contains_key(key)
+    }
+
     pub fn call_fn(&self, key: &str, arg: Option<PyObject>) -> PyResult<PyObject> {
         let functions = self.functions.read().unwrap();
         if let Some(function) = functions.get(key) {

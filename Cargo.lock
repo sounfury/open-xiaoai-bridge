@@ -716,7 +716,7 @@ checksum = "42f5e15c9953c5e4ccceeb2e7382a716482c34515315f7b03532b8b4e8393d2d"
 [[package]]
 name = "open-xiaoai"
 version = "1.0.0"
-source = "git+https://github.com/coderzc/open-xiaoai.git?branch=main#0e8ebbc9c92f5ac319974d1ca8180e572d1697e6"
+source = "git+https://github.com/OwnDing/open-xiaoai.git?rev=7ecea6fef330488676d48b2e954acfef9c0366ec#7ecea6fef330488676d48b2e954acfef9c0366ec"
 dependencies = [
  "futures",
  "rand",
