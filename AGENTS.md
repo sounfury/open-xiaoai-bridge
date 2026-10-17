@@ -21,6 +21,8 @@ open-xiaoai-bridge/
 │   ├── openclaw.py                # OpenClaw 网关客户端（连接、消息、TTS 播放）
 │   ├── openclaw_conversation.py   # OpenClaw 连续对话循环（VAD → ASR → Agent → TTS）
 │   ├── wakeup_session.py          # 小智唤醒会话状态机
+│   ├── muse.py                    # 小爱管家（你好缪斯）路由：文本解析、webhook 客户端、单次处理器
+│   ├── muse_followup.py           # 小爱管家追问一句（复用外部后端输入链路）
 │   ├── ref.py                     # 全局引用注册表（get/set 依赖注入）
 │   ├── models/                    # 模型文件（KWS/VAD/ASR，.gitignore 排除）
 │   ├── assets/sounds/             # 音效（tts_notify.mp3 等）
@@ -174,7 +176,13 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 **路由规则**（`before_wakeup` 返回值）:
 - `"xiaozhi"` → 走小智流程
 - `"openclaw"` → 走 OpenClaw 连续对话
+- `"muse"` → 小爱管家单次请求（`core/muse.py`：可选追问一句 → 播报"稍等" → POST webhook），需 `MUSE_ENABLE=1`
 - `None` → 不处理（用户自行处理）
+
+**小爱管家（muse）边界约束**:
+- 只做单次转发，不等待回复；回复由 agent 调 `/api/play/text` 推送
+- 追问复用 `ExternalConversationController` 的输入链路（`core/muse_followup.py`），`on_interrupt()` 只停止追问，不取消已发出的 webhook 请求
+- `core/muse.py` 顶层不能导入 `open_xiaoai_server`（config.py / 测试会直接导入）
 
 **边界约束**:
 - 它是"小智唤醒会话状态机"，不是通用事件总线
@@ -211,7 +219,8 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 
 ### APIServer (core/services/api_server.py)
 
-HTTP REST API 服务器（aiohttp），端口可配（默认 9092）。
+HTTP REST API 服务器（aiohttp），端口可配（默认 9092），默认监听 `127.0.0.1`（`API_SERVER_HOST`）。
+设置 `API_SERVER_TOKEN` 后除 `/api/health` 外都需要 `Authorization: Bearer <token>`。
 
 | 端点 | 方法 | 功能 |
 |------|------|------|
@@ -322,7 +331,12 @@ python3 tests/test_tts_latency.py --formats mp3,pcm --rounds 3 --repeat 8
 
 # OpenClaw 连通性测试
 python3 tests/test_openclaw_live_connectivity.py
+
+# 小爱管家路由 / API 鉴权（无音箱、无原生扩展）
+python3 -m pytest tests/test_muse*.py
 ```
+
+注意：`DoubaoTTS` 在类定义时调用 `ConfigManager.instance()`，真实实例会把 `DEVICE_ID` 写回当前目录的 `config.py`；新测试导入相关模块时应先 stub `ConfigManager.instance`。
 
 ## 音箱设备控制命令
 

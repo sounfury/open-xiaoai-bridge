@@ -12,6 +12,10 @@ services:
       - OPENCLAW_ENABLE=1       # 启用 OpenClaw（兼容旧值 OPENCLAW_ENABLED）
       # - QWENPAW_ENABLE=1       # 启用 QwenPaw（可选）
       # - XIAOZHI_ENABLE=1       # 启用小智 AI（可选）
+      # - MUSE_ENABLE=1          # 启用小爱管家"你好缪斯"路由（可选）
+      # - MUSE_WEBHOOK_URL=      # 小爱管家 webhook 地址
+      # - MUSE_WEBHOOK_TOKEN=    # 小爱管家 webhook token（不要提交到仓库）
+      # - API_SERVER_TOKEN=      # 设置后 /api/*（/api/health 除外）需 Authorization: Bearer <token>
     volumes:
       - ./config.py:/app/config.py
       - ./openclaw:/app/openclaw

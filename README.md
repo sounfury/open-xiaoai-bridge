@@ -110,10 +110,14 @@ OPEN_XIAOAI_TOKEN=your-secret-token API_SERVER_ENABLE=1 ./scripts/start.sh
 | `OPENCLAW_ENABLE`    | 启用 OpenClaw | 禁用            |
 | `OPENAI_ENABLE` | 启用 OpenAI 兼容服务 | 禁用        |
 | `QWENPAW_ENABLE` | 启用 QwenPaw | 禁用        |
+| `MUSE_ENABLE`        | 启用小爱管家（"你好缪斯"）路由，见[小爱管家](#-小爱管家你好缪斯) | 禁用 |
+| `MUSE_WEBHOOK_URL`   | 小爱管家 webhook 地址（优先于 config `muse.url`） | 空（不转发） |
+| `MUSE_WEBHOOK_TOKEN` | 小爱管家 webhook token（优先于 config `muse.token`） | 空（不带鉴权头） |
 | `API_SERVER_ENABLE`  | 启用 HTTP API | 禁用            |
 | `AUDIO_INPUT_ENABLE` | 启用音频输入（关闭后小智/KWS/local\_asr不可用） | 启用            |
-| `API_SERVER_HOST`    | API 监听地址    | `127.0.0.1`   |
+| `API_SERVER_HOST`    | API 监听地址（建议保持 `127.0.0.1`，仅本机可调用） | `127.0.0.1`   |
 | `API_SERVER_PORT`    | API 监听端口    | `9092`        |
+| `API_SERVER_TOKEN`   | API 鉴权 token，设置后 `/api/*`（`/api/health` 除外）需携带 `Authorization: Bearer <token>` | 不鉴权 |
 | `OPEN_XIAOAI_TOKEN`  | Client 鉴权 token，设置后仅持有相同 token 的 Client 才能连接 | 不鉴权 |
 | `CONFIG_PATH`        | 自定义配置文件路径   | `./config.py` |
 | `LOGLEVEL`           | 日志级别        | `INFO`        |
@@ -300,7 +304,9 @@ curl POST /api/play/text → API Server → SpeakerManager → 小爱音箱
 
 ## 🔌 API Server
 
-设置 `API_SERVER_ENABLE=1` 启用，默认端口 **9092**。
+设置 `API_SERVER_ENABLE=1` 启用，默认端口 **9092**，默认只监听 `127.0.0.1`。
+
+**可选鉴权**：设置 `API_SERVER_TOKEN` 后，除 `/api/health` 外的接口都需要携带 `Authorization: Bearer <token>`，否则返回 `401`；未设置时保持无鉴权。监听 `0.0.0.0`（如 Docker）时建议同时设置 token。`skills/xiaoai-tts` 通过环境变量 `OPENXIAOAI_API_TOKEN` 传入同一个 token。
 
 ### 📡 端点列表
 
@@ -340,6 +346,12 @@ curl -X POST http://localhost:9092/api/tts/doubao \
 
 # 打断播放
 curl -X POST http://localhost:9092/api/interrupt
+
+# 设置了 API_SERVER_TOKEN 时；request_id 可选，用于日志关联并原样返回
+curl -X POST http://127.0.0.1:9092/api/play/text \
+  -H "Authorization: Bearer $API_SERVER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"text": "好的，已安排", "request_id": "<webhook 里的 request_id>"}'
 ```
 
 ***
@@ -710,7 +722,7 @@ async def before_wakeup(speaker, text, source, app):
     # 返回 None → 交给小爱原生处理
 ```
 
-**返回值含义：** `"openclaw"` → OpenClaw 连续对话，`"openai"` → OpenAI 兼容服务连续对话，`"qwenpaw"` → QwenPaw 连续对话，`"xiaozhi"` → 小智 AI，`None` → 不处理（用户可自行调用 `app.send_to_openclaw()` / `app.send_to_openai()` / `app.send_to_qwenpaw()` 等方法）
+**返回值含义：** `"openclaw"` → OpenClaw 连续对话，`"openai"` → OpenAI 兼容服务连续对话，`"qwenpaw"` → QwenPaw 连续对话，`"xiaozhi"` → 小智 AI，`"muse"` → 单次转发到[小爱管家](#-小爱管家你好缪斯)，`None` → 不处理（用户可自行调用 `app.send_to_openclaw()` / `app.send_to_openai()` / `app.send_to_qwenpaw()` 等方法）
 
 ### 🧠 多 Agent 路由 — 一个唤醒词，一个专属 Agent
 
@@ -869,6 +881,107 @@ APP_CONFIG = {
 唤醒词触发后，`before_wakeup` 返回 `"xiaozhi"` 即进入小智对话流程。
 
 详见[自定义唤醒词](#-自定义唤醒词)章节。
+
+***
+
+## 🎼 小爱管家（你好缪斯）
+
+本 fork 新增的单次请求路由：说 **"你好缪斯 + 问题"**，bridge 先播报"稍等"，再把识别文本 POST 到小爱管家（Grok Bot agent）的 webhook；
+小爱管家处理完后经 AgentDock 在本机调用 `POST http://127.0.0.1:9092/api/play/text` 推送回复。**"小爱同学"原生链路不受影响**。
+
+设置 `MUSE_ENABLE=1` 启用（会同时启用 KWS 关键词生成和 VAD/KWS，与其他后端相同）。
+
+### 触发方式
+
+| 说法 | 来源 | 行为 |
+| --- | --- | --- |
+| "你好缪斯"（本地 KWS 命中） | `kws` | 播放提示音后追问一句（`muse.input_mode`），再转发 |
+| "小爱同学" → "你好缪斯，我今晚想洗澡" | `xiaoai` | 去掉唤醒词和标点，拦截原生小爱回复（`muse.native_suppress`），直接转发"我今晚想洗澡" |
+| "小爱同学" → "你好缪斯" | `xiaoai` | 按外部唤醒词处理（拦截原生对话），追问一句再转发 |
+| "小爱同学，开灯" | `xiaoai` | 原生小爱处理，不经过 bridge 转发 |
+
+文本匹配忽略空格和中英文标点（"你好缪斯我今晚想洗澡"、"你好 缪斯，我今晚想洗澡" 都可以）；默认要求唤醒词在句首（`muse.match_mode = "prefix"`）。
+ASR 常把"缪斯"识别成别的写法时，可在 `muse.wake_word_aliases` 里补充。追问超时（`muse.followup_timeout`，默认 8 秒）未听到内容则安静退出。
+
+路由在 `config.py` 的 `before_wakeup` 里，返回 `"muse"` 后由 `EventManager` 调用 `core/muse.py` 的 `MuseRequestHandler`：
+
+```python
+from core.muse import match_muse_text, suppress_native_xiaoai
+
+if match_muse_text(text):          # MUSE_ENABLE 未开启时恒为 None
+    if source == "xiaoai":
+        await suppress_native_xiaoai(speaker)
+    return "muse"
+```
+
+> 使用自定义 `config.py`（Docker 挂载 / `CONFIG_PATH`）时，需要把上面这段 `before_wakeup` 代码、`wakeup.keywords` 里的 `"你好缪斯"` 和 `APP_CONFIG["muse"]` 一起合并进去，否则不会触发。
+
+### 配置
+
+| 项 | 环境变量 / `APP_CONFIG["muse"]` | 默认值 |
+| --- | --- | --- |
+| webhook 地址 | `MUSE_WEBHOOK_URL` / `url` | 空：只打印警告，不转发、不播"稍等" |
+| webhook token | `MUSE_WEBHOOK_TOKEN` / `token` | 空：不发送鉴权头 |
+| 鉴权头 | `auth_header` + `auth_scheme` | `Authorization: Bearer <token>`；`auth_scheme: ""` 时直接发送 token |
+| 超时 / 重试 | `timeout` / `retries` / `retry_backoff` | 10 秒 / 2 次 / 0.5 秒起指数退避；仅网络错误、超时、5xx、429 重试，其他 4xx 不重试 |
+| payload 标识 | `source` / `speaker` / `wake_word` | `xiaoai-oh2p` / `desk` / `你好缪斯` |
+| 提示语 | `wait_text` / `failure_text` / `not_configured_text` / `no_input_text` | `稍等` / `小爱管家暂时连不上` / 空 / 空（空字符串表示不播报） |
+| 原生拦截 | `native_suppress` | `abort`（同 `召唤龙虾` 示例，重启小爱约 1-2 秒）；可选 `dialog`、`none` |
+| 追问输入 | `input_mode` / `followup_timeout` | `local_asr` / 8 秒 |
+
+token 只从环境变量或本地配置读取，日志不会输出 token，webhook 地址在日志里只显示 `scheme://host:port`。
+
+### Webhook payload
+
+```http
+POST <MUSE_WEBHOOK_URL>
+Content-Type: application/json; charset=utf-8
+Authorization: Bearer <MUSE_WEBHOOK_TOKEN>
+```
+
+```json
+{
+  "request_id": "0fd9f0e4-de73-4539-ab9f-dd257b29bed5",
+  "source": "xiaoai-oh2p",
+  "speaker": "desk",
+  "wake_word": "你好缪斯",
+  "text": "我今晚想洗澡",
+  "app": "xiaoai",
+  "ts": "2026-10-16T21:30:00+08:00",
+  "reply": {"mode": "push"}
+}
+```
+
+- `app`：唤醒来源（`"kws"` / `"xiaoai"`），不会序列化 `MainApp` 对象。
+- `ts`：本机时区的 ISO 8601 时间。
+- 重试时复用同一个 `request_id`，接收端可据此去重；收到 2xx 即视为已投递，bridge 不等待回复。
+- 回复时可把 `request_id` 带进 `/api/play/text`，便于对照日志。
+
+### 无音箱测试
+
+```bash
+# 单元测试（stub 掉原生扩展，用本地 aiohttp mock webhook）
+python -m pytest tests/test_muse*.py
+python -m unittest discover -s tests -p "test_muse*.py"
+
+# 终端 1：本地 mock webhook，打印收到的 payload
+python scripts/mock_muse_webhook.py                    # http://127.0.0.1:18080/webhook
+#   --require-token 校验 MUSE_WEBHOOK_TOKEN；--fail-first 2 测重试；--delay 15 测超时
+#   --reply-to http://127.0.0.1:9092/api/play/text 模拟小爱管家回推播报
+
+# 终端 2：走 config.before_wakeup + MuseRequestHandler，音箱动作只打印
+python scripts/simulate_muse.py "你好缪斯，我今晚想洗澡" --url http://127.0.0.1:18080/webhook
+python scripts/simulate_muse.py 你好缪斯 --source kws --followup "把台灯调暗一点" \
+    --url http://127.0.0.1:18080/webhook
+```
+
+接上音箱后：
+
+```bash
+MUSE_ENABLE=1 API_SERVER_ENABLE=1 \
+MUSE_WEBHOOK_URL=<小爱管家 webhook> MUSE_WEBHOOK_TOKEN=<token> \
+API_SERVER_TOKEN=<本机 API token，可选> ./scripts/start.sh
+```
 
 ***
 

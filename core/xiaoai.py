@@ -34,6 +34,8 @@ class XiaoAI:
     _external_wakeup_keywords: set[str] = set()
     _suppressed_dialog_ids: set[str] = set()
     _suppressed_dialog_last_attempt: dict[str, float] = {}
+    # dialog_id of the latest final command passed to before_wakeup (used by core/muse.py)
+    last_recognize_dialog_id: str = ""
     _MAX_SUPPRESSED_DIALOGS = 100
     _SUPPRESS_RETRY_INTERVAL = 0.35
 
@@ -233,6 +235,7 @@ class XiaoAI:
                         return
                     elif text and is_final:
                         logger.info(f"[XiaoAI] 🔥 收到指令: {text}")
+                        cls.last_recognize_dialog_id = dialog_id
                         cls.conversation.reset_retries()
                         await cls.conversation.handle_text_command(
                             text,

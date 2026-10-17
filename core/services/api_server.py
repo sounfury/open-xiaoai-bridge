@@ -4,6 +4,7 @@ Provides endpoints to play text/audio remotely
 """
 
 import asyncio
+import hmac
 import json
 import os
 import tempfile
@@ -21,14 +22,50 @@ from core.utils.logger import logger
 class APIServer:
     """HTTP API Server to control XiaoZhi speaker remotely"""
 
-    def __init__(self, host: str = "0.0.0.0", port: int = 8080):
+    # Endpoints that stay open even when API_SERVER_TOKEN is set
+    PUBLIC_PATHS = frozenset({"/api/health"})
+
+    def __init__(
+        self,
+        host: str = "0.0.0.0",
+        port: int = 8080,
+        token: str | None = None,
+    ):
         self.host = host
         self.port = port
         self.config = ConfigManager.instance()
-        self.app = web.Application()
+        # Optional bearer auth: unset / empty API_SERVER_TOKEN keeps the no-auth behaviour
+        if token is None:
+            token = os.environ.get("API_SERVER_TOKEN", "")
+        self._token = token.strip()
+        self.app = web.Application(middlewares=[self._auth_middleware])
         self.runner = None
         self.site = None
         self._setup_routes()
+
+    @web.middleware
+    async def _auth_middleware(self, request: web.Request, handler):
+        if self._token and request.path not in self.PUBLIC_PATHS:
+            if not self._is_authorized(request):
+                logger.warning(
+                    f"[APIServer] Unauthorized request: {request.method} {request.path} "
+                    f"from {request.remote}"
+                )
+                return web.json_response(
+                    {"success": False, "error": "Unauthorized"},
+                    status=401,
+                    headers={"WWW-Authenticate": "Bearer"},
+                )
+        return await handler(request)
+
+    def _is_authorized(self, request: web.Request) -> bool:
+        scheme, _, credentials = request.headers.get("Authorization", "").partition(" ")
+        if scheme.lower() != "bearer":
+            return False
+        return hmac.compare_digest(
+            credentials.strip().encode("utf-8"),
+            self._token.encode("utf-8"),
+        )
 
     def _setup_routes(self):
         """Setup API routes"""
@@ -66,7 +103,16 @@ class APIServer:
         await self.runner.setup()
         self.site = web.TCPSite(self.runner, self.host, self.port)
         await self.site.start()
-        logger.info(f"[APIServer] HTTP server started at http://{self.host}:{self.port}")
+        logger.info(
+            f"[APIServer] HTTP server started at http://{self.host}:{self.port} "
+            f"(auth: {'bearer token' if self._token else 'disabled'})"
+        )
+        if not self._token and self.host not in ("127.0.0.1", "localhost", "::1"):
+            logger.warning(
+                f"[APIServer] Listening on {self.host} without API_SERVER_TOKEN; "
+                "anyone on the network can call the API. "
+                "Prefer API_SERVER_HOST=127.0.0.1 or set API_SERVER_TOKEN."
+            )
 
     async def stop(self):
         """Stop the HTTP server"""
@@ -85,7 +131,8 @@ class APIServer:
             {
                 "text": "你好",           # required
                 "blocking": false,        # optional, default false
-                "timeout": 60000          # optional, timeout in ms
+                "timeout": 60000,         # optional, timeout in ms
+                "request_id": "uuid"      # optional, for log correlation (echoed back)
             }
         """
         try:
@@ -100,6 +147,9 @@ class APIServer:
 
             blocking = data.get("blocking", False)
             timeout = data.get("timeout", 10 * 60 * 1000)
+            request_id = data.get("request_id")
+            request_id = str(request_id)[:128] if request_id is not None else None
+            extra = {"request_id": request_id} if request_id is not None else {}
 
             speaker = get_speaker()
             if not speaker:
@@ -108,13 +158,20 @@ class APIServer:
                     status=503
                 )
 
+            logger.info(
+                f"[APIServer] play/text request_id={request_id or '-'} "
+                f"blocking={blocking} chars={len(str(text))}"
+            )
+
             # Run in background to not block the response
             if blocking:
                 result = await speaker.play(text=text, blocking=True, timeout=timeout)
-                return web.json_response({"success": result})
+                return web.json_response({"success": result, **extra})
             else:
                 asyncio.create_task(speaker.play(text=text, blocking=False, timeout=timeout))
-                return web.json_response({"success": True, "message": "Playing text in background"})
+                return web.json_response(
+                    {"success": True, "message": "Playing text in background", **extra}
+                )
 
         except json.JSONDecodeError:
             return web.json_response(

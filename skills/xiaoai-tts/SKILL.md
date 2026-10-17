@@ -13,6 +13,7 @@ description: Control Xiaoai speaker via OpenXiaoAI Voice API for high-quality TT
 
 ```bash
 OPENXIAOAI_BASE_URL="http://192.168.x.x:9092"  # OpenXiaoAI 服务地址
+OPENXIAOAI_API_TOKEN=""                         # 可选：服务端设置了 API_SERVER_TOKEN 时填同一个值
 ```
 
 ## 使用方法

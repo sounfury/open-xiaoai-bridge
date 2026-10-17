@@ -16,13 +16,20 @@ def get_api_config():
     return base_url.rstrip("/")
 
 
+def get_auth_headers():
+    """服务端设置了 API_SERVER_TOKEN 时，用 OPENXIAOAI_API_TOKEN 传入同一个 token"""
+    token = os.environ.get("OPENXIAOAI_API_TOKEN", "").strip()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def api_request(path, method="GET", data=None, headers=None):
     """发送 API 请求"""
     base_url = get_api_config()
     full_url = f"{base_url}{path}"
-    
+
     default_headers = {
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        **get_auth_headers(),
     }
     if headers:
         default_headers.update(headers)

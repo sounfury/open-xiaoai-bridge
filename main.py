@@ -91,6 +91,12 @@ def setup_config():
         f"QwenPaw: {'启用' if enable_qwenpaw else '禁用'}",
         module="Main",
     )
+    from core.muse import is_muse_enabled
+
+    logger.info(
+        f"小爱管家（你好缪斯）: {'启用' if is_muse_enabled() else '禁用'}",
+        module="Main",
+    )
     logger.info(
         f"API Server: {'启用' if enable_api_server else '禁用'}",
         module="Main",

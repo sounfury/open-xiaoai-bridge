@@ -26,6 +26,7 @@ from core.services.protocols.typing import (
 from core.openclaw import OpenClawManager
 from core.openai import OpenAIManager
 from core.qwenpaw import QwenPawManager
+from core.muse import is_muse_enabled
 from core.services.api_server import APIServer
 
 
@@ -214,11 +215,13 @@ class MainApp:
         main_loop_thread.start()
 
         # Start audio services
+        enable_muse = is_muse_enabled()
         if (
             self._enable_xiaozhi
             or self._enable_openclaw
             or self._enable_openai
             or self._enable_qwenpaw
+            or enable_muse
         ):
             # Check audio input via env var (same as Rust), default True
             # Supports: "true"/"false", "1"/"0", "yes"/"no", "on"/"off"
@@ -253,6 +256,11 @@ class MainApp:
                     and self.config.get_app_config(
                         "qwenpaw.input_mode", "local_asr"
                     )
+                    == "local_asr"
+                )
+                or (
+                    enable_muse
+                    and self.config.get_app_config("muse.input_mode", "local_asr")
                     == "local_asr"
                 )
             ):

@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased (fork: sounfury/open-xiaoai-bridge)
+
+### 重点更新
+
+- 新增小爱管家"你好缪斯"单次路由（M1，`MUSE_ENABLE=1` 启用）：KWS 命中唤醒词或小爱 ASR 文本以唤醒词开头时，`before_wakeup` 返回 `"muse"`，先播报"稍等"，再把去掉唤醒词的文本 POST 到 webhook（`MUSE_WEBHOOK_URL` / `MUSE_WEBHOOK_TOKEN`，带超时与 5xx/429/网络错误重试）；只说唤醒词时复用 `local_asr` / `xiaoai_asr` 输入链路追问一句。"小爱同学"原生链路不变。
+- HTTP API 新增可选 Bearer 鉴权：设置 `API_SERVER_TOKEN` 后 `/api/*`（`/api/health` 除外）需携带 `Authorization: Bearer <token>`；未设置时行为不变。`skills/xiaoai-tts` 支持 `OPENXIAOAI_API_TOKEN`。
+- `/api/play/text` 支持可选 `request_id` 字段（写入日志并原样返回）。
+
+### 开发与测试
+
+- 新增 `tests/test_muse.py`、`tests/test_muse_api_server.py`，无需音箱与原生扩展。
+- 新增 `scripts/mock_muse_webhook.py`（本地 mock webhook）和 `scripts/simulate_muse.py`（无音箱模拟一次缪斯请求）。
+
 ## v1.0.7 - 2026-07-14
 
 ### 重点更新

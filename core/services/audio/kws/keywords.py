@@ -39,14 +39,20 @@ def should_generate_keywords():
         "true",
         "yes",
     )
+    muse_enabled = os.environ.get("MUSE_ENABLE", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
     if (
         not xiaozhi_enabled
         and not openclaw_enabled
         and not openai_enabled
         and not qwenpaw_enabled
+        and not muse_enabled
     ):
-        return False, "XIAOZHI_ENABLE, OPENCLAW_ENABLE/OPENCLAW_ENABLED, OPENAI_ENABLE and QWENPAW_ENABLE are all disabled"
+        return False, "XIAOZHI_ENABLE, OPENCLAW_ENABLE/OPENCLAW_ENABLED, OPENAI_ENABLE, QWENPAW_ENABLE and MUSE_ENABLE are all disabled"
 
     return True, ""
 
