@@ -1,4 +1,4 @@
-"""Main application controller.
+﻿"""Main application controller.
 
 This module manages the main application flow, coordinating between:
 - XiaoAI (Xiaomi speaker service)
@@ -180,7 +180,13 @@ class MainApp:
         time.sleep(0.1)
 
         # Initialize XiaoAI service
-        asyncio.run_coroutine_threadsafe(XiaoAI.init_xiaoai(), self.loop)
+        # Windows: pyo3-async-runtimes start_server does not bind when scheduled via
+# run_coroutine_threadsafe on a background loop; run it with asyncio.run in its own thread.
+        threading.Thread(
+            target=lambda: asyncio.run(XiaoAI.init_xiaoai()),
+            daemon=True,
+            name="xiaoai-ws-server",
+        ).start()
 
         if self._enable_xiaozhi:
             # Create XiaoZhi instance

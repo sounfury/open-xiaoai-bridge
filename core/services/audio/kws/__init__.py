@@ -1,3 +1,5 @@
+"""音箱关键词唤醒服务：准备唤醒词和模型，监听音频并派发唤醒事件。"""
+
 import asyncio
 import os
 import threading
@@ -42,11 +44,13 @@ class _KWS:
         min_silence_ms = kws_config.get("min_silence_duration", 480)
         self.vad_min_silence_frames = int(min_silence_ms / self.frame_duration_ms)
 
-    def _on_config_reload(self, *_args):
-        """配置重载后刷新运行时参数。"""
-        self.apply_runtime_config()
-
     def start(self):
+        # 必须先完成词表和模型初始化，再启动线程并报告成功；不能在后台静默失败。
+        from core.services.audio.kws.keywords import main as generate_keywords
+
+        if generate_keywords() != 0:
+            raise RuntimeError("KWS 唤醒词生成失败，请检查模型词表和配置")
+        SherpaOnnx.start()
         self.audio = MyAudio.create()
         self.stream = self.audio.open(
             format=AudioConfig.FORMAT,
@@ -77,8 +81,29 @@ class _KWS:
     def resume(self):
         self.paused = False
 
+    def on_message(self, text: str):
+        loop = get_app().loop if get_app() else get_xiaoai().async_loop
+        logger.debug(f"[KWS] Dispatch wakeup event: {text}")
+        future = asyncio.run_coroutine_threadsafe(
+            EventManager.wakeup(text, "kws"),
+            loop,
+        )
+
+        def _log_result(done_future):
+            try:
+                done_future.result()
+            except Exception as exc:
+                logger.error(f"[KWS] Wakeup dispatch failed: {type(exc).__name__}: {exc}")
+
+        future.add_done_callback(_log_result)
+
+    # ===== 私有方法 =====
+
+    def _on_config_reload(self, *_args):
+        """配置重载后刷新运行时参数。"""
+        self.apply_runtime_config()
+
     def _detection_loop(self):
-        SherpaOnnx.start()
         self.stream.start_stream()
         while True:
             # 读取缓冲区音频数据
@@ -153,22 +178,6 @@ class _KWS:
                         # preventing leftover audio from the previous utterance
                         # from combining with the next one.
                         SherpaOnnx.reset()
-
-    def on_message(self, text: str):
-        loop = get_app().loop if get_app() else get_xiaoai().async_loop
-        logger.debug(f"[KWS] Dispatch wakeup event: {text}")
-        future = asyncio.run_coroutine_threadsafe(
-            EventManager.wakeup(text, "kws"),
-            loop,
-        )
-
-        def _log_result(done_future):
-            try:
-                done_future.result()
-            except Exception as exc:
-                logger.error(f"[KWS] Wakeup dispatch failed: {type(exc).__name__}: {exc}")
-
-        future.add_done_callback(_log_result)
 
 
 KWS = _KWS()

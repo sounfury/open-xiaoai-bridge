@@ -1,4 +1,10 @@
+"""本地关键词识别：加载 Sherpa KWS 模型并处理音箱音频帧。"""
+
 import numpy as np
+
+from core.utils.onnx_runtime import prepare_onnxruntime
+
+prepare_onnxruntime()
 import sherpa_onnx
 
 from core.utils.config import ConfigManager

@@ -1,4 +1,4 @@
-"""OpenAI-compatible service manager.
+"""OpenAI 兼容服务管理：连接 Hermes 等后端，收发对话消息并播放回复。
 
 This module talks to any OpenAI-compatible Chat Completions endpoint,
 including Hermes Agent API server mode.
@@ -77,9 +77,21 @@ class OpenAIManager:
                 else False
             )
 
-        cls._base_url = str(config.get("base_url", "http://127.0.0.1:8000/v1")).rstrip("/")
-        cls._api_key = str(config.get("api_key", "") or "")
-        cls._model = str(config.get("model", "gpt-4o-mini"))
+        # Env overrides (OPENAI_BASE_URL / OPENAI_API_KEY / OPENAI_MODEL) beat config.py
+        # so secrets can live in start-bridge.bat / .hermes_api_key without editing the repo.
+        cls._base_url = str(
+            get_env("OPENAI_BASE_URL")
+            or config.get("base_url", "http://127.0.0.1:8000/v1")
+        ).rstrip("/")
+        cls._api_key = str(
+            get_env("OPENAI_API_KEY")
+            or config.get("api_key", "")
+            or ""
+        )
+        cls._model = str(
+            get_env("OPENAI_MODEL")
+            or config.get("model", "gpt-4o-mini")
+        )
         cls._session_key = str(config.get("session_key", "agent:default:open-xiaoai-bridge"))
         cls._session_header = str(config.get("session_header", "X-Hermes-Session-Key") or "").strip()
         cls._system_prompt = str(config.get("system_prompt", "") or "")
@@ -114,18 +126,6 @@ class OpenAIManager:
             logger.info(
                 f"[OpenAI] Enabled, base_url={cls._base_url}, model={cls._model}"
             )
-
-    @classmethod
-    def _optional_float(cls, value) -> float | None:
-        if value is None or value == "":
-            return None
-        return float(value)
-
-    @classmethod
-    def _optional_int(cls, value) -> int | None:
-        if value is None or value == "":
-            return None
-        return int(value)
 
     @classmethod
     async def connect(cls) -> bool:
@@ -171,13 +171,6 @@ class OpenAIManager:
         return cls._session_tts_speakers.get(target_session_key) or cls._tts_speaker
 
     @classmethod
-    def _resolve_tts_provider(cls, tts_speaker: str | None) -> str:
-        """Resolve an explicit provider while preserving the legacy speaker rule."""
-        from core.services.tts.router import TTSRouter
-
-        return TTSRouter.resolve_provider(cls._tts_provider, tts_speaker)
-
-    @classmethod
     async def send(cls, text: str, wait_response: bool = False) -> str | None:
         run_id = await cls._send_and_track(text)
         if run_id is None:
@@ -208,6 +201,27 @@ class OpenAIManager:
             return response_text
         finally:
             cls._response_tts_speakers.pop(run_id, None)
+
+    # ===== 私有方法 =====
+
+    @classmethod
+    def _optional_float(cls, value) -> float | None:
+        if value is None or value == "":
+            return None
+        return float(value)
+
+    @classmethod
+    def _optional_int(cls, value) -> int | None:
+        if value is None or value == "":
+            return None
+        return int(value)
+
+    @classmethod
+    def _resolve_tts_provider(cls, tts_speaker: str | None) -> str:
+        """Resolve an explicit provider while preserving the legacy speaker rule."""
+        from core.services.tts.router import TTSRouter
+
+        return TTSRouter.resolve_provider(cls._tts_provider, tts_speaker)
 
     @classmethod
     async def _send_and_track(cls, text: str) -> str | None:
@@ -245,6 +259,7 @@ class OpenAIManager:
     @classmethod
     async def _run_chat_completion(cls, run_id: str, text: str):
         try:
+            cls.last_error = None
             response_text = await cls._request_chat_completion(text)
             if response_text:
                 cls._response_texts[run_id] = response_text
@@ -283,10 +298,19 @@ class OpenAIManager:
                 json=payload,
                 headers=headers,
             ) as response:
-                body = await response.json(content_type=None)
                 if response.status >= 400:
-                    message = body.get("error", body) if isinstance(body, dict) else body
-                    raise RuntimeError(f"HTTP {response.status}: {message}")
+                    # 网关 502 等错误通常是 HTML，先检查状态，避免被 JSON 错误掩盖。
+                    raise RuntimeError(
+                        f"HTTP {response.status}: 后端服务请求失败 "
+                        f"(Content-Type={response.headers.get('Content-Type', 'unknown')})"
+                    )
+                try:
+                    body = await response.json(content_type=None)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        f"HTTP {response.status}: 后端返回了非 JSON 响应 "
+                        f"(Content-Type={response.headers.get('Content-Type', 'unknown')})"
+                    ) from exc
 
         response_text = cls._extract_response_text(body)
         if response_text:

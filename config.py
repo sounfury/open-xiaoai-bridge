@@ -1,3 +1,5 @@
+"""用户配置：音箱接入、音频参数、唤醒路由及各 AI 后端设置。"""
+
 import asyncio
 import socket
 import subprocess
@@ -50,6 +52,10 @@ async def before_wakeup(speaker, text, source, app):
     if match_muse_text(text):
         if source == "xiaoai":
             await suppress_native_xiaoai(speaker)  # 拦截原生小爱对这句话的处理
+        # OPENAI_ENABLE=1 时走 Hermes 连续对话，不再打小爱管家 webhook
+        import os
+        if os.environ.get("OPENAI_ENABLE", "").lower() in ("1", "true", "yes"):
+            return "openai"
         return "muse"
 
     if source == "kws":
@@ -216,8 +222,8 @@ APP_CONFIG = {
         "min_silence_duration": 500,
     },
     "audio_input": {
-        # Input gain multiplier before VAD/KWS/ASR. Use 1.0 to disable.
-        "gain": 1.0,
+        # 进入 VAD/KWS/ASR 前放大麦克风输入；本机 OH2P 音量偏低，设为 1.0 可关闭。
+        "gain": 4.0,
     },
     "asr": {
         # 支持 "sense_voice"（默认）、"paraformer"、"fire_red_asr" 或 "doubao"
@@ -250,7 +256,7 @@ APP_CONFIG = {
         "OTA_URL": "http://127.0.0.1:8003/xiaozhi/ota/",
         "WEBSOCKET_URL": "ws://127.0.0.1:8000/xiaozhi/v1/",
         "WEBSOCKET_ACCESS_TOKEN": "", #（可选）一般用不到这个值
-        "DEVICE_ID": "", #（可选）默认自动生成
+        "DEVICE_ID": "7c:70:db:88:15:d9", #（可选）默认自动生成
         "VERIFICATION_CODE": "", # 首次登陆时，验证码会在这里更新
     },
     "xiaoai": {
@@ -277,6 +283,10 @@ APP_CONFIG = {
     "openclaw": {
         "url": "ws://127.0.0.1:18789",  # OpenClaw WebSocket 地址
         "token": "your_openclaw_token",  # OpenClaw 认证令牌
+        "listening_light": {
+            "enabled": True,  # 每轮本地监听时亮灯，结束或中断时熄灯
+            "effect_id": 9,  # 复用 Muse / OpenAI 已验证的 OH2P 监听灯效
+        },
         # 输入模式：
         #   - "local_asr": 现有链路，使用本地 VAD + SherpaASR
         #   - "xiaoai_asr": 实验链路，唤醒小爱后接管原生 ASR 结果给 OpenClaw
@@ -313,9 +323,17 @@ APP_CONFIG = {
     # OpenAI-compatible Service Configuration
     # 可接入 Hermes Agent API Server、OpenAI、Ollama、LM Studio 等兼容 /v1/chat/completions 的服务
     "openai": {
-        "base_url": "http://127.0.0.1:8000/v1",
+        # Defaults; start-bridge.bat env OPENAI_* overrides these (api_key via .hermes_api_key)
+        "base_url": "https://hermes.oci.sounfury.top/v1",
         "api_key": "",
-        "model": "gpt-4o-mini",
+        "model": "muse-home",
+        "listening_light": {
+            "enabled": True,  # 连续对话按监听、思考、回答阶段切换，退出或中断时清理
+            "effect_id": 9,  # 复用 Muse 已验证的 OH2P 监听灯效
+            "thinking_effect_id": 2,  # 固件 wakeup.sh 的 think 灯效
+            "speaking_effect_id": 3,  # 固件 wakeup.sh 的 speek 灯效
+        },
+        "failure_text": "我听到了，但缪斯服务暂时没有返回回答，请稍后再试",
         # 输入模式：
         #   - "local_asr": 使用本地 VAD + SherpaASR
         #   - "xiaoai_asr": 接管小爱原生 ASR 结果
@@ -348,6 +366,10 @@ APP_CONFIG = {
         # 正常情况下 agentId 直接从 session_key 的第二段解析，无需单独配置。
         "agent_id": "default",
         "user_id": "open-xiaoai-bridge",
+        "listening_light": {
+            "enabled": True,  # 每轮本地监听时亮灯，结束或中断时熄灯
+            "effect_id": 9,  # 复用 Muse / OpenAI 已验证的 OH2P 监听灯效
+        },
         # 输入模式：
         #   - "local_asr": 使用本地 VAD + SherpaASR
         #   - "xiaoai_asr": 接管小爱原生 ASR 结果
@@ -433,6 +455,11 @@ APP_CONFIG = {
         #   "local_asr" — 本地 VAD + ASR；"xiaoai_asr" — 接管小爱原生 ASR
         "input_mode": "local_asr",
         "followup_timeout": 8,  # 追问等待时长（秒）
+        "followup_prompt": "我在，请讲",  # 唤醒后的听取提示，设为 "" 只播放提示音
+        "listening_light": {
+            "enabled": True,  # 本地追问期间亮灯，录音结束、超时或中断后熄灯
+            "effect_id": 9,  # OH2P 固件 noangle 监听灯效；只定向关闭该编号
+        },
         "wait_text": "稍等",  # 转发前的即时反馈，设为 "" 可关闭
         "failure_text": "小爱管家暂时连不上",  # 重试后仍失败时播报，设为 "" 可关闭
         "not_configured_text": "",  # 未配置 webhook 地址时播报（默认关闭）

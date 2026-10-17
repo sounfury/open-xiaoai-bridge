@@ -9,7 +9,7 @@
 import asyncio
 
 from core.external_conversation import ExternalConversationController
-from core.ref import get_vad
+from core.ref import get_speaker, get_vad
 from core.utils.logger import logger
 
 
@@ -40,8 +40,18 @@ class MuseFollowupCapture(ExternalConversationController):
         self._loop = asyncio.get_running_loop()
         logger.info("🎙️ 等待请求内容", module=self.LOG_MODULE)
         try:
+            await self._turn_on_light()
             await self._stop_recording()
+            prompt = self._cfg("followup_prompt", "")
+            speaker = get_speaker()
+            if prompt and speaker:
+                try:
+                    await speaker.play(text=str(prompt), blocking=True, timeout=10000)
+                except Exception as exc:
+                    logger.warning(f"追问提示播放失败，继续听取请求: {exc}", module=self.LOG_MODULE)
             await self._play_notify()
+            if not self.active:
+                return None
             await self._start_recording()
 
             if self.uses_xiaoai_asr():
@@ -55,6 +65,7 @@ class MuseFollowupCapture(ExternalConversationController):
                 )
                 return None
             speech_bytes = await self._wait_for_speech(vad)
+            await self._turn_off_light()
             if not speech_bytes:
                 return None
 
@@ -66,6 +77,7 @@ class MuseFollowupCapture(ExternalConversationController):
             # 被 stop() 打断时（如用户喊了"小爱同学"）不要再去关小爱的监听
             ended_naturally = self.active
             self.stop()
+            await self._turn_off_light()
             if ended_naturally and self.uses_xiaoai_asr():
                 await self._stop_xiaoai_native_listening()
 
@@ -76,3 +88,5 @@ class MuseFollowupCapture(ExternalConversationController):
         self.active = False
         self._cancel_vad_future()
         self._cancel_xiaoai_asr_future()
+        # 被打断时立即熄灯，不等 capture_once 的 finally
+        self._release_light_soon()

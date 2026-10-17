@@ -1,3 +1,5 @@
+"""唤醒词生成工具：将配置中的常规与 Muse 唤醒词编码到 keywords.txt。"""
+
 import re
 import unicodedata
 from pathlib import Path
@@ -143,6 +145,9 @@ def main():
         )
         return 1
 
+    from core.utils.onnx_runtime import prepare_onnxruntime
+
+    prepare_onnxruntime()
     from sherpa_onnx import text2token
 
     args = get_args()

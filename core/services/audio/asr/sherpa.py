@@ -1,4 +1,4 @@
-"""Sherpa-ONNX offline ASR with configurable model backend.
+"""本地语音识别：按配置加载 Sherpa 模型，将音箱 PCM 音频转为文字。
 
 Provides local speech-to-text recognition for the OpenClaw conversation flow.
 The model is lazily loaded on first use to avoid blocking startup.
@@ -12,6 +12,10 @@ Supported backends (set via APP_CONFIG["asr"]["model"]):
 import os
 
 import numpy as np
+
+from core.utils.onnx_runtime import prepare_onnxruntime
+
+prepare_onnxruntime()
 import sherpa_onnx
 
 from core.utils.config import ConfigManager
@@ -48,6 +52,40 @@ class _SherpaASR:
 
     def __init__(self):
         self._recognizer = None
+
+    def asr(self, pcm_bytes: bytes, sample_rate: int = 16000) -> str:
+        """Recognize speech from raw PCM int16 audio bytes.
+
+        Args:
+            pcm_bytes: Raw PCM audio data (int16, mono).
+            sample_rate: Sample rate of the audio (default 16000).
+
+        Returns:
+            Recognized text string, or empty string if nothing recognized.
+        """
+        self._ensure_loaded()
+
+        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
+        samples = samples.astype(np.float32) / 32768.0
+
+        stream = self._recognizer.create_stream()
+        stream.accept_waveform(sample_rate, samples)
+        self._recognizer.decode_stream(stream)
+
+        text = stream.result.text.strip()
+
+        # Apply custom text replacements from config
+        if text:
+            cfg = ConfigManager.instance()
+            replacements = cfg.get_app_config("asr.replacements", {})
+            for old, new in replacements.items():
+                text = text.replace(old, new)
+            logger.debug(f"[ASR] Recognized: {text}", module="ASR")
+        else:
+            logger.debug("[ASR] No speech recognized", module="ASR")
+        return text
+
+    # ===== 私有方法 =====
 
     def _get_backend(self) -> str:
         cfg = ConfigManager.instance()
@@ -158,37 +196,6 @@ class _SherpaASR:
             f"模型={backend}, 路径={model_dir}, int8={self._use_int8()}",
         )
 
-    def asr(self, pcm_bytes: bytes, sample_rate: int = 16000) -> str:
-        """Recognize speech from raw PCM int16 audio bytes.
-
-        Args:
-            pcm_bytes: Raw PCM audio data (int16, mono).
-            sample_rate: Sample rate of the audio (default 16000).
-
-        Returns:
-            Recognized text string, or empty string if nothing recognized.
-        """
-        self._ensure_loaded()
-
-        samples = np.frombuffer(pcm_bytes, dtype=np.int16)
-        samples = samples.astype(np.float32) / 32768.0
-
-        stream = self._recognizer.create_stream()
-        stream.accept_waveform(sample_rate, samples)
-        self._recognizer.decode_stream(stream)
-
-        text = stream.result.text.strip()
-
-        # Apply custom text replacements from config
-        if text:
-            cfg = ConfigManager.instance()
-            replacements = cfg.get_app_config("asr.replacements", {})
-            for old, new in replacements.items():
-                text = text.replace(old, new)
-            logger.debug(f"[ASR] Recognized: {text}", module="ASR")
-        else:
-            logger.debug("[ASR] No speech recognized", module="ASR")
-        return text
 
 
 SherpaASR = _SherpaASR()
