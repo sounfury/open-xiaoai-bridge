@@ -32,6 +32,7 @@ class XiaoAI:
     _input_gain = 1.0
     _async_loop_ready = threading.Event()
     _external_wakeup_keywords: set[str] = set()
+    _muse_wakeup_keywords: set[str] = set()
     _suppressed_dialog_ids: set[str] = set()
     _suppressed_dialog_last_attempt: dict[str, float] = {}
     # dialog_id of the latest final command passed to before_wakeup (used by core/muse.py)
@@ -58,6 +59,15 @@ class XiaoAI:
             for keyword in wakeup_keywords
             if isinstance(keyword, str) and cls._normalize_text(keyword)
         }
+        # 小爱管家的 KWS 唤醒词在生成 keywords.txt 时才合并（MUSE_ENABLE=1），这里同步一份，
+        # 用缪斯自己的归一化（忽略全半角 / 大小写 / 标点）比较，例如原生 ASR 给出 "Hey, Muse."
+        from core.muse import kws_wake_words, normalize_wake_text
+
+        cls._muse_wakeup_keywords = {
+            normalize_wake_text(keyword)
+            for keyword in kws_wake_words(cls.config_manager.get_app_config)
+            if normalize_wake_text(keyword)
+        }
 
     @staticmethod
     def _normalize_text(text: str) -> str:
@@ -68,7 +78,15 @@ class XiaoAI:
     @classmethod
     def _is_external_wakeup_text(cls, text: str) -> bool:
         normalized = cls._normalize_text(text)
-        return bool(normalized) and normalized in cls._external_wakeup_keywords
+        if not normalized:
+            return False
+        if normalized in cls._external_wakeup_keywords:
+            return True
+        if cls._muse_wakeup_keywords:
+            from core.muse import normalize_wake_text
+
+            return normalize_wake_text(text) in cls._muse_wakeup_keywords
+        return False
 
     @classmethod
     async def _suppress_dialog(cls, dialog_id: str, reason: str):

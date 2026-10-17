@@ -44,7 +44,7 @@ async def before_wakeup(speaker, text, source, app):
         不调用则自动使用 openclaw.session_key 的默认值，无需手动重置。
     """
     # --- 小爱管家："你好缪斯" → 先播"稍等"，再转发到 webhook（MUSE_ENABLE 未开启时不生效）---
-    # KWS 命中唤醒词，或小爱 ASR 文本以唤醒词开头（如"你好缪斯，我今晚想洗澡"）
+    # KWS 命中唤醒词，或小爱 ASR 文本以 muse.wake_words 中任一项开头（如"你好缪斯，我今晚想洗澡"、"Hey Muse，开灯"）
     from core.muse import match_muse_text, suppress_native_xiaoai
 
     if match_muse_text(text):
@@ -179,6 +179,7 @@ async def after_wakeup(speaker, source=None, session_key=None):
 APP_CONFIG = {
     "wakeup": {
         # 自定义唤醒词列表（英文字母要全小写）
+        # MUSE_ENABLE=1 时，生成 keywords.txt 会自动并入 muse.kws_wake_words（无需在这里重复）
         "keywords": [
             "你好小智",
             "小智小智",
@@ -386,9 +387,42 @@ APP_CONFIG = {
         "retry_backoff": 0.5,  # 重试退避基数（秒），按 0.5s、1s… 递增
         "source": "xiaoai-oh2p",  # payload.source
         "speaker": "desk",  # payload.speaker
-        "wake_word": "你好缪斯",  # payload.wake_word；同时需要在 wakeup.keywords 中保留
-        "wake_word_aliases": [],  # ASR 常见误识别写法，例如 ["你好缪思"]
-        # "prefix"：文本必须以唤醒词开头；"contains"：文本任意位置包含唤醒词
+        # 规范唤醒词：始终参与匹配；payload.wake_word 在无法确定命中写法时用它
+        "wake_word": "你好缪斯",
+        # ASR 文本前缀匹配的完整唤醒词集合（环境变量 MUSE_WAKE_WORDS 优先，用 , ， 、 分隔）
+        # 匹配规则：
+        #   - 忽略大小写、全半角、空格和中英文标点："hi muse" 也匹配 "Hi Muse" / "himuse" / "Hi，Muse"
+        #   - 只在句首匹配；句首的标点和 leading_fillers 里的语气词可以跳过
+        #   - 最长优先（"你好缪斯" 先于 "缪斯"）；英文唤醒词要求词边界（"museum" 不算 "muse"）
+        #   - 去掉唤醒词及其后的标点后转发，payload.wake_word 为命中的那一项（这里的写法）
+        # 单独的"缪斯" / "muse"只在句首生效；妙思 / 木斯 / 慕斯 本身是常见词，只接受带问候语的写法
+        "wake_words": [
+            # 正写 + 英文
+            "你好缪斯", "嗨缪斯", "哈喽缪斯", "嘿缪斯", "hi缪斯", "hey缪斯", "hello缪斯",
+            "hi muse", "hey muse", "hello muse", "你好muse", "嗨muse", "哈喽muse", "嘿muse",
+            "缪斯", "muse",
+            # 同音字（miù sī），也可以单独使用
+            "你好缪思", "嗨缪思", "哈喽缪思", "嘿缪思", "缪思",
+            "你好缪丝", "嗨缪丝", "哈喽缪丝", "嘿缪丝", "缪丝",
+            "你好谬斯", "嗨谬斯", "哈喽谬斯", "嘿谬斯", "谬斯",
+            "你好谬思", "嗨谬思", "哈喽谬思", "嘿谬思", "谬思",
+            # 近音字，只接受带问候语的写法
+            "你好妙思", "嗨妙思", "哈喽妙思", "嘿妙思",
+            "你好妙斯", "嗨妙斯", "哈喽妙斯", "嘿妙斯",
+            "你好木斯", "嗨木斯", "哈喽木斯", "嘿木斯",
+            "你好慕斯", "嗨慕斯", "哈喽慕斯", "嘿慕斯",
+        ],
+        # 合并进本地 KWS（常驻监听）的子集（环境变量 MUSE_KWS_WAKE_WORDS 优先；[] = 不额外加入）
+        #   - 只放"问候语 + 名字"：单独的"缪斯" / "muse" 只有 2 个音节，常驻监听误唤醒风险高，只走 ASR 前缀
+        #   - 同音/近音字只走 ASR：KWS 按汉字建模，每多一种写法就多一条常驻误唤醒路径
+        #   - 这些词同时也会参与 ASR 前缀匹配；编码失败（模型词表没有的字）的会被跳过并告警
+        "kws_wake_words": ["你好缪斯", "嗨缪斯", "哈喽缪斯", "hi muse", "hey muse", "hello muse"],
+        "wake_word_aliases": [],  # 追加到 wake_words 的额外写法（兼容旧配置）
+        # 唤醒词前可以跳过的语气词（只在句首，可重复）；设为 [] 关闭
+        # 不含"那个"：它也是指示代词（"那个缪斯是谁"），去掉会让单独的"缪斯"更容易误触发
+        "leading_fillers": ["嗯", "呃", "额", "啊", "喂", "诶", "欸", "哎", "um", "uh", "hmm", "emm"],
+        # "prefix"（默认）：唤醒词必须在句首
+        # "contains"：任意位置包含唤醒词即可——会让单独的"缪斯"/"muse"严重误触发，不建议开启
         "match_mode": "prefix",
         # 小爱原生识别出缪斯文本时如何拦截原生回复：
         #   "abort"  — speaker.abort_xiaoai()（重启小爱服务，约 1-2 秒）

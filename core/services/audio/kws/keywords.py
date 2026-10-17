@@ -1,4 +1,5 @@
 import re
+import unicodedata
 from pathlib import Path
 
 
@@ -57,15 +58,70 @@ def should_generate_keywords():
     return True, ""
 
 
+def _keyword_text(keyword: str) -> str:
+    """KWS 关键词文本：NFKC（全角 → 半角）、英文转大写（BPE 词表是大写）、合并多余空格。"""
+    return " ".join(unicodedata.normalize("NFKC", keyword).upper().split())
+
+
+def get_keyword_texts(config_getter) -> list[str]:
+    """wakeup.keywords + 小爱管家 KWS 子集（MUSE_ENABLE=1 时，见 core/muse.py），去重保序。"""
+    from core.muse import kws_wake_words
+
+    keywords = list(config_getter("wakeup.keywords", []) or [])
+    keywords += kws_wake_words(config_getter)
+    texts: list[str] = []
+    for keyword in keywords:
+        if not isinstance(keyword, str):
+            continue
+        text = _keyword_text(keyword)
+        if text and text not in texts:
+            texts.append(text)
+    return texts
+
+
 def get_args():
     config = ConfigManager.instance()
     tokens_type = "cjkchar+bpe"
     tokens = get_model_file_path("tokens.txt")
     bpe_model = get_model_file_path("bpe.model")
     output = get_model_file_path("keywords.txt")
-    keywords = config.get_app_config("wakeup.keywords", [])
-    texts = [f"{keyword.upper()}" for keyword in keywords]
+    texts = get_keyword_texts(config.get_app_config)
     return locals()
+
+
+def encode_keywords(texts, text2token, **kwargs) -> list[list[str]]:
+    """逐个编码关键词；编码失败（含 OOV 字符）的跳过并警告，不影响其他关键词。
+
+    sherpa_onnx.text2token 遇到 OOV 只会 print 并静默丢掉该条，
+    返回列表会变短，所以这里一条一条编码，才能知道是哪一条被跳过。
+    """
+    encoded: list[list[str]] = []
+    for text in texts:
+        try:
+            result = text2token([text], **kwargs)
+        except Exception as exc:
+            logger.warning(
+                f"关键词 {text!r} 编码失败，已跳过: {type(exc).__name__}: {exc}",
+                module="KWS",
+            )
+            continue
+        tokens = result[0] if result else None
+        if not tokens:
+            logger.warning(
+                f"关键词 {text!r} 含有模型词表（tokens.txt）里没有的字符，已跳过",
+                module="KWS",
+            )
+            continue
+        encoded.append(list(tokens))
+    return encoded
+
+
+def format_keyword_line(tokens: list[str]) -> str:
+    """纯英文关键词不带 @phrase（KWS 返回拼接的 token，如 "hi▁muse"），其余带 @原文。"""
+    line = "".join(tokens)
+    if re.match(r"^[▁A-Z\s]+$", line):
+        return " ".join(tokens)
+    return " ".join(tokens) + f" @{line}"
 
 
 def main():
@@ -90,20 +146,23 @@ def main():
     from sherpa_onnx import text2token
 
     args = get_args()
-    encoded_texts = text2token(
+    encoded_texts = encode_keywords(
         args["texts"],
+        text2token,
         tokens=args["tokens"],
         tokens_type=args["tokens_type"],
         bpe_model=args["bpe_model"],
     )
+    if not encoded_texts:
+        logger.error("Keyword generation failed: no keyword could be encoded", module="KWS")
+        return 1
     with open(args["output"], "w", encoding="utf8") as f:
-        for _, txt in enumerate(encoded_texts):
-            line = "".join(txt)
-            if re.match(r"^[▁A-Z\s]+$", line):
-                f.write(" ".join(txt) + "\n")
-            else:
-                f.write(" ".join(txt) + f" @{line}" + "\n")
-    logger.debug(f"Keyword file generated: {args['output']}", module="KWS")
+        for txt in encoded_texts:
+            f.write(format_keyword_line(txt) + "\n")
+    logger.debug(
+        f"Keyword file generated: {args['output']} ({len(encoded_texts)}/{len(args['texts'])} keywords)",
+        module="KWS",
+    )
     return 0
 
 

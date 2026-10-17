@@ -113,6 +113,8 @@ OPEN_XIAOAI_TOKEN=your-secret-token API_SERVER_ENABLE=1 ./scripts/start.sh
 | `MUSE_ENABLE`        | 启用小爱管家（"你好缪斯"）路由，见[小爱管家](#-小爱管家你好缪斯) | 禁用 |
 | `MUSE_WEBHOOK_URL`   | 小爱管家 webhook 地址（优先于 config `muse.url`） | 空（不转发） |
 | `MUSE_WEBHOOK_TOKEN` | 小爱管家 webhook token（优先于 config `muse.token`） | 空（不带鉴权头） |
+| `MUSE_WAKE_WORDS`    | 小爱管家 ASR 唤醒词集合，用 `,` `，` `、` 分隔（替换 config `muse.wake_words`） | 见[唤醒词](#唤醒词) |
+| `MUSE_KWS_WAKE_WORDS` | 并入本地 KWS 的小爱管家唤醒词（替换 config `muse.kws_wake_words`） | 见[唤醒词](#唤醒词) |
 | `API_SERVER_ENABLE`  | 启用 HTTP API | 禁用            |
 | `AUDIO_INPUT_ENABLE` | 启用音频输入（关闭后小智/KWS/local\_asr不可用） | 启用            |
 | `API_SERVER_HOST`    | API 监听地址（建议保持 `127.0.0.1`，仅本机可调用） | `127.0.0.1`   |
@@ -895,13 +897,52 @@ APP_CONFIG = {
 
 | 说法 | 来源 | 行为 |
 | --- | --- | --- |
-| "你好缪斯"（本地 KWS 命中） | `kws` | 播放提示音后追问一句（`muse.input_mode`），再转发 |
-| "小爱同学" → "你好缪斯，我今晚想洗澡" | `xiaoai` | 去掉唤醒词和标点，拦截原生小爱回复（`muse.native_suppress`），直接转发"我今晚想洗澡" |
-| "小爱同学" → "你好缪斯" | `xiaoai` | 按外部唤醒词处理（拦截原生对话），追问一句再转发 |
-| "小爱同学，开灯" | `xiaoai` | 原生小爱处理，不经过 bridge 转发 |
+| "你好缪斯" / "嗨缪斯" / "hey muse"（本地 KWS 命中） | `kws` | 播放提示音后追问一句（`muse.input_mode`），再转发 |
+| "小爱同学" → "你好缪斯，我今晚想洗澡" / "Muse，我今晚想洗澡" | `xiaoai` | 去掉唤醒词和标点，拦截原生小爱回复（`muse.native_suppress`），直接转发"我今晚想洗澡" |
+| "小爱同学" → "你好缪斯" / "Hey Muse" | `xiaoai` | 等于某个 KWS 唤醒词：按外部唤醒词处理（拦截原生对话），追问一句再转发 |
+| "小爱同学" → "缪斯" | `xiaoai` | 只说了唤醒词：拦截原生回复，追问一句再转发 |
+| "小爱同学，开灯" / "我喜欢缪斯" / "museum 门票多少钱" | `xiaoai` | 原生小爱处理，不经过 bridge 转发 |
 
-文本匹配忽略空格和中英文标点（"你好缪斯我今晚想洗澡"、"你好 缪斯，我今晚想洗澡" 都可以）；默认要求唤醒词在句首（`muse.match_mode = "prefix"`）。
-ASR 常把"缪斯"识别成别的写法时，可在 `muse.wake_word_aliases` 里补充。追问超时（`muse.followup_timeout`，默认 8 秒）未听到内容则安静退出。
+追问超时（`muse.followup_timeout`，默认 8 秒）未听到内容则安静退出。
+
+### 唤醒词
+
+唤醒词是一个**集合**（口误、ASR 误识别都能命中），分两层：
+
+| 层 | 配置 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| ASR 文本前缀匹配 | `MUSE_WAKE_WORDS` > `muse.wake_words`（再加上 `wake_word`、`wake_word_aliases`、KWS 子集） | 52 个写法，见下 | 小爱原生 ASR / 本地 KWS 的识别文本都走这里 |
+| 本地 KWS（常驻监听） | `MUSE_KWS_WAKE_WORDS` > `muse.kws_wake_words` | `你好缪斯` `嗨缪斯` `哈喽缪斯` `hi muse` `hey muse` `hello muse` | `MUSE_ENABLE=1` 时生成 `keywords.txt` 自动并入 `wakeup.keywords`（去重），无需手动重复 |
+
+默认 ASR 集合（`config.py` 的 `muse.wake_words`，与 `core/muse.py` 的 `DEFAULT_WAKE_WORDS` 一致）：
+
+- 正写 / 英文：`你好缪斯` `嗨缪斯` `哈喽缪斯` `嘿缪斯` `hi缪斯` `hey缪斯` `hello缪斯` `hi muse` `hey muse` `hello muse` `你好muse` `嗨muse` `哈喽muse` `嘿muse`
+- 单独的名字：`缪斯` `muse`
+- 同音字（miù sī），可带问候语（你好 / 嗨 / 哈喽 / 嘿），也可单独使用：`缪思` `缪丝` `谬斯` `谬思`
+- 近音字，**只接受带问候语**（你好 / 嗨 / 哈喽 / 嘿）：`妙思` `妙斯` `木斯` `慕斯`——它们本身是常见词（妙思泉涌、佳木斯、慕斯蛋糕）
+
+匹配规则（`core/muse.py` 的 `parse_muse_text`）：
+
+1. **归一化**：先做 NFKC（全角 → 半角）、忽略大小写，再去掉所有空白和中英文标点（包括 sherpa 英文关键词结果里的 `▁`）。所以 `hi muse` 同时匹配 `Hi Muse`、`himuse`、`Hi，Muse！`、`ＨＩ　ＭＵＳＥ`；`你好缪斯` 匹配 `你好，缪斯`。
+2. **只在句首**（`muse.match_mode = "prefix"`）：句首的标点、空白和语气词可以跳过。语气词由 `muse.leading_fillers` 配置，默认 `嗯 呃 额 啊 喂 诶 欸 哎 um uh hmm emm`，可重复出现，设为 `[]` 关闭。`"我喜欢缪斯"`、`"今天妙思路清晰"` 不会触发。`"那个"` 不在默认语气词里，因为它也是指示代词（"那个缪斯是谁"）。旧的 `"contains"` 模式仍可显式开启，但会让单独的"缪斯"/"muse"严重误触发，不建议使用。
+3. **最长优先**：`你好缪斯` 先于 `缪斯`，`hey muse` 先于 `muse`。
+4. **英文词边界**：以英文字母结尾的唤醒词，后面紧跟的字符不能是英文字母或数字。`museum`、`musea`、`mused`、`hi museum` 不触发；`muse, 开灯`、`muse开灯`、`Muse 我今晚想洗澡` 触发。
+5. **中文不设词边界**：ASR 经常不打标点，`缪斯开灯` 必须能匹配；代价是 `缪斯特罗姆` 这类以"缪斯"开头的罕见说法也会触发。所以容易和常见词混淆的近音字只收带问候语的写法。
+6. **去掉唤醒词**：转发的 `text` 是原文去掉唤醒词及其后标点的部分（`"Hey Muse！！ 开灯"` → `"开灯"`）；剩下的只有语气词或标点时，视为只说了唤醒词，走追问。
+7. **`payload.wake_word`** 是命中的那一项在配置里的写法：说"嗨，缪思"得到 `"嗨缪思"`，KWS 返回 `hi▁muse` 得到 `"hi muse"`。文本里没有唤醒词时（例如追问内容）用 `muse.wake_word`（`你好缪斯`）。
+
+**为什么 KWS 只放 6 个**：KWS 模型（`tokens.txt` + `bpe.model`，`cjkchar+bpe`）对上面所有候选都能编码——汉字全在词表里，英文走 BPE（`hi muse` → `▁HI ▁MU S E`，`hey muse` → `▁HE Y ▁MU S E`）。但 KWS 是常驻监听的：
+
+- 单独的 `缪斯` / `muse` 只有 2 个音节，常驻监听下误唤醒风险高，所以只走 ASR 前缀（需要先说"小爱同学"）；
+- KWS 按汉字建模，`缪斯` / `谬斯` / `缪思` 是不同的 token 序列，每多一种写法就多一条常驻误唤醒路径。同音字和近音字交给 ASR 前缀匹配兜底；实测发现 KWS 漏掉某种写法时，再用 `MUSE_KWS_WAKE_WORDS` 补上；
+- 生成 `keywords.txt` 时逐条编码，含模型词表外字符的关键词会被跳过并打印警告，不影响其他后端的关键词。
+
+KWS 子集里的词始终参与 ASR 匹配，`muse.wake_word` 也始终在集合里。用 `MUSE_WAKE_WORDS` 替换集合时，如果也不想要默认的 KWS 词，同时设置 `MUSE_KWS_WAKE_WORDS`（或在 config 里把 `kws_wake_words` 设为 `[]`）：
+
+```bash
+MUSE_WAKE_WORDS="你好缪斯，缪斯，hey muse、muse" \
+MUSE_KWS_WAKE_WORDS="你好缪斯,hey muse" ./scripts/start.sh
+```
 
 路由在 `config.py` 的 `before_wakeup` 里，返回 `"muse"` 后由 `EventManager` 调用 `core/muse.py` 的 `MuseRequestHandler`：
 
@@ -914,7 +955,8 @@ if match_muse_text(text):          # MUSE_ENABLE 未开启时恒为 None
     return "muse"
 ```
 
-> 使用自定义 `config.py`（Docker 挂载 / `CONFIG_PATH`）时，需要把上面这段 `before_wakeup` 代码、`wakeup.keywords` 里的 `"你好缪斯"` 和 `APP_CONFIG["muse"]` 一起合并进去，否则不会触发。
+> 使用自定义 `config.py`（Docker 挂载 / `CONFIG_PATH`）时，需要把上面这段 `before_wakeup` 代码和 `APP_CONFIG["muse"]` 一起合并进去，否则不会触发。
+> 旧配置里没有 `wake_words` / `kws_wake_words` / `leading_fillers` 时使用代码里的默认值；KWS 子集在生成 `keywords.txt` 时自动并入，`wakeup.keywords` 里不需要再写缪斯唤醒词（写了也会去重）。
 
 ### 配置
 
@@ -924,7 +966,8 @@ if match_muse_text(text):          # MUSE_ENABLE 未开启时恒为 None
 | webhook token | `MUSE_WEBHOOK_TOKEN` / `token` | 空：不发送鉴权头 |
 | 鉴权头 | `auth_header` + `auth_scheme` | `Authorization: Bearer <token>`；`auth_scheme: ""` 时直接发送 token |
 | 超时 / 重试 | `timeout` / `retries` / `retry_backoff` | 10 秒 / 2 次 / 0.5 秒起指数退避；仅网络错误、超时、5xx、429 重试，其他 4xx 不重试 |
-| payload 标识 | `source` / `speaker` / `wake_word` | `xiaoai-oh2p` / `desk` / `你好缪斯` |
+| payload 标识 | `source` / `speaker` / `wake_word` | `xiaoai-oh2p` / `desk` / `你好缪斯`（`wake_word` 只是回退值，实际发送命中的唤醒词） |
+| 唤醒词 | `MUSE_WAKE_WORDS` / `wake_words`、`MUSE_KWS_WAKE_WORDS` / `kws_wake_words`、`wake_word_aliases`、`leading_fillers`、`match_mode` | 见[唤醒词](#唤醒词)；`match_mode` 默认 `prefix` |
 | 提示语 | `wait_text` / `failure_text` / `not_configured_text` / `no_input_text` | `稍等` / `小爱管家暂时连不上` / 空 / 空（空字符串表示不播报） |
 | 原生拦截 | `native_suppress` | `abort`（同 `召唤龙虾` 示例，重启小爱约 1-2 秒）；可选 `dialog`、`none` |
 | 追问输入 | `input_mode` / `followup_timeout` | `local_asr` / 8 秒 |
@@ -952,6 +995,7 @@ Authorization: Bearer <MUSE_WEBHOOK_TOKEN>
 }
 ```
 
+- `wake_word`：命中的唤醒词（配置里的写法，如 `"hey muse"`、`"你好缪思"`）；`text` 已去掉唤醒词。
 - `app`：唤醒来源（`"kws"` / `"xiaoai"`），不会序列化 `MainApp` 对象。
 - `ts`：本机时区的 ISO 8601 时间。
 - 重试时复用同一个 `request_id`，接收端可据此去重；收到 2xx 即视为已投递，bridge 不等待回复。
