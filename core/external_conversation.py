@@ -11,8 +11,13 @@ Key design decisions:
   - Uses per-session asyncio.Future objects so it never conflicts with the
     XiaoZhi wakeup session state machine.
   - Never calls abort_xiaoai() (which would break the FileMonitor).
-  - TTS playback is blocking (awaited), so the next listening round
-    only starts after the response has finished playing.
+  - TTS playback is awaited, so the next listening round only starts after
+    the response has finished playing — unless the user barges in: with the
+    speaker's echo reference live (barge_in.enabled), the microphone stays on
+    while speaking, KWS keeps listening, and a wake word stops the reply and
+    starts the next turn right away (speech after the wake word is kept).
+  - Lights are state-driven (core/services/conversation_light.py) and never
+    block the voice flow.
 """
 
 import asyncio
@@ -20,8 +25,8 @@ import os
 
 import open_xiaoai_server
 
-from core.ref import get_speaker, get_vad
-from core.services.listening_light import ListeningLight
+from core.ref import get_kws, get_speaker, get_vad, get_xiaoai
+from core.services.conversation_light import ConversationLight, effects_from_config
 from core.utils.config import ConfigManager
 
 _NOTIFY_SOUND_PATH = os.path.join(
@@ -87,8 +92,10 @@ class ExternalConversationController:
         self._loop: asyncio.AbstractEventLoop | None = None
         # Playback token for the current TTS session
         self._playback_token: int | None = None
-        self._light_token: object | None = None
-        self._light_refresh_task: asyncio.Task | None = None
+        self._light: ConversationLight | None = None
+        # 打断后下一轮从 GlobalStream 的这个位置开始补录（唤醒词之后已经说出的话）
+        self._barge_in_from: int | None = None
+        self._background_tasks: set[asyncio.Task] = set()
 
     @property
     def exit_keywords(self) -> list[str]:
@@ -127,6 +134,14 @@ class ExternalConversationController:
             return
         self.active = True
         self._loop = asyncio.get_running_loop()
+        self._barge_in_from = None
+        self._light = ConversationLight(
+            get_speaker(),
+            effects_from_config(
+                self._cfg("listening_light", {}), native_listening=self.uses_xiaoai_asr()
+            ),
+            self._loop,
+        )
 
         logger.info(f"🎙️ 进入 {self.BACKEND_NAME} 连续对话模式", module=self.LOG_MODULE)
 
@@ -141,7 +156,11 @@ class ExternalConversationController:
             )
         finally:
             self.stop()
-            await self._turn_off_light()
+            light, self._light = self._light, None
+            if light is not None:
+                await light.close()
+            # 会话结束：无论是否在关麦期间退出，都允许看门狗恢复录音
+            self._set_recording_wanted(True)
 
     def stop(self):
         """Exit conversation mode and clean up."""
@@ -150,7 +169,10 @@ class ExternalConversationController:
         self.active = False
         self._cancel_vad_future()
         self._cancel_xiaoai_asr_future()
-        self._release_light_soon()
+        kws = get_kws()
+        if kws and hasattr(kws, "disarm_barge_in"):
+            kws.disarm_barge_in()
+        self._light_state("off")
         if self._playback_token is not None:
             open_xiaoai_server.stop_tts_playback(self._playback_token)
             self._playback_token = None
@@ -214,76 +236,51 @@ class ExternalConversationController:
     def _cfg(self, key: str, default=None):
         return self.config.get_app_config(f"{self.CONFIG_PREFIX}.{key}", default)
 
-    async def _turn_on_light(self):
-        """开启本轮监听灯。"""
-        await self._set_light_phase("listening")
+    def _light_state(self, state: str):
+        """切换会话灯状态（立即返回，可在任意线程调用）。"""
+        if self._light is not None:
+            self._light.set(state)
 
-    async def _set_light_phase(self, phase: str):
-        """切换监听、思考和回答灯效，释放上一阶段的灯效凭据。"""
-        await self._turn_off_light()
-        light = self._cfg("listening_light", {}) or {}
-        if not isinstance(light, dict):
-            return
-        if not light.get("enabled", False):
-            return
-        if phase == "listening" and self.uses_xiaoai_asr():
-            return
-        if phase != "listening" and not self.active:
-            return
-        key = "effect_id" if phase == "listening" else f"{phase}_effect_id"
-        effect_id = light.get(key, 9 if phase == "listening" else None)
-        self._light_token = await ListeningLight.turn_on(
-            get_speaker(), effect_id
-        )
-        if phase == "speaking" and self._light_token is not None:
-            self._light_refresh_task = asyncio.create_task(
-                self._refresh_speaking_light(self._light_token)
-            )
+    def _barge_cfg(self, key: str, default=None):
+        return self.config.get_app_config(f"barge_in.{key}", default)
 
-    async def _refresh_speaking_light(self, token: object):
-        """播报期间维持回答灯，设备自行熄灯后最迟半秒恢复。"""
-        while self.active and self._light_token is token:
-            await asyncio.sleep(0.5)
-            if not self.active or self._light_token is not token:
-                return
-            if not await ListeningLight.refresh(token):
-                return
+    def _barge_in_ready(self) -> bool:
+        """打断已开启，且音箱正在发送回采（回声能消掉）。"""
+        if not self._barge_cfg("enabled", False):
+            return False
+        xiaoai = get_xiaoai()
+        live = getattr(xiaoai, "echo_reference_live", None)
+        kws = get_kws()
+        return bool(live and live() and kws and hasattr(kws, "arm_barge_in"))
 
-    async def _turn_off_light(self):
-        """释放本次监听持有的灯效，允许正常结束和中断路径重复清理。"""
-        token, self._light_token = self._light_token, None
-        refresh_task, self._light_refresh_task = self._light_refresh_task, None
-        if refresh_task is not None:
-            refresh_task.cancel()
-            try:
-                await refresh_task
-            except asyncio.CancelledError:
-                pass
-        await ListeningLight.turn_off(token)
+    @staticmethod
+    def _set_recording_wanted(wanted: bool):
+        """告诉录音看门狗现在是否应该有录音（主动关麦时不要重新打开）。"""
+        xiaoai = get_xiaoai()
+        if xiaoai and hasattr(xiaoai, "set_recording_wanted"):
+            xiaoai.set_recording_wanted(wanted)
 
-    def _release_light_soon(self):
-        """同步路径（如 stop()，可能在其他线程调用）立即提交熄灯，不等待采集协程收尾。"""
-        token, self._light_token = self._light_token, None
-        refresh_task, self._light_refresh_task = self._light_refresh_task, None
-        if refresh_task is not None and self._loop and self._loop.is_running():
-            self._loop.call_soon_threadsafe(refresh_task.cancel)
-        if token is not None and self._loop and self._loop.is_running():
-            asyncio.run_coroutine_threadsafe(ListeningLight.turn_off(token), self._loop)
+    def _background(self, coro):
+        task = asyncio.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     # ---- conversation loop ----
 
     async def _conversation_loop(self):
         """Run VAD -> ASR -> backend -> TTS turns until exit."""
 
-        # Mute mic → play notify → unmute.
-        # _play_notify() blocks for ~740ms (the beep duration), during which
-        # the mic is off and before_wakeup TTS echo naturally fades.
+        # 没有回采时：关麦 → 提示音 → 开麦，避免录到 before_wakeup 的播报和提示音。
+        # 有回采时麦克风一直开着，回声由回声消除去掉。
         # VAD.resume() resets all state (speech_frames, input_bytes),
         # so speech detection starts clean when listening begins.
-        await self._stop_recording()
-        logger.debug("Recording stopped", module=self.LOG_MODULE)
-        await self._play_notify()
-        await self._start_recording()
+        if self._barge_in_ready():
+            await self._play_notify()
+        else:
+            await self._stop_recording()
+            await self._play_notify()
+            await self._start_recording()
         logger.debug("Ready to listen", module=self.LOG_MODULE)
 
         while self.active:
@@ -307,7 +304,7 @@ class ExternalConversationController:
             "continue" - turn completed, loop to next
             "exit"     - user said an exit keyword
             "timeout"  - no speech detected within timeout
-            "interrupted" - stop() was called while the light was turning on
+            "interrupted" - stop() was called before listening started
             "error"    - unrecoverable error
         """
         vad = get_vad()
@@ -316,60 +313,56 @@ class ExternalConversationController:
             return "error"
 
         # 1. Start listening for speech (recording is already active)
-        try:
-            await self._turn_on_light()
-            if not self.active:
-                return "interrupted"
-            speech_bytes = await self._wait_for_speech(vad)
-        finally:
-            # 录音结束后释放监听灯，后续阶段按需切换灯效。
-            await self._turn_off_light()
+        self._light_state("listening")
+        if not self.active:
+            return "interrupted"
+        barge_in_from, self._barge_in_from = self._barge_in_from, None
+        speech_bytes = await self._wait_for_speech(vad, preroll_from=barge_in_from)
         if speech_bytes is None:
             return "timeout"
 
-        try:
-            await self._set_light_phase("thinking")
-            logger.debug(
-                f"Got speech buffer: {len(speech_bytes)} bytes",
-                module=self.LOG_MODULE,
-            )
+        self._light_state("thinking")
+        logger.debug(
+            f"Got speech buffer: {len(speech_bytes)} bytes",
+            module=self.LOG_MODULE,
+        )
 
-            # 2. ASR: convert speech to text
-            from core.services.audio.asr import ASRService
+        # 2. ASR: convert speech to text
+        from core.services.audio.asr import ASRService
 
-            text = ASRService.asr(speech_bytes, sample_rate=16000)
-            if not text or not any(character.isalnum() for character in text):
-                logger.debug("ASR empty, retrying", module=self.LOG_MODULE)
-                return "continue"
-
-            # 3. Check exit keywords
-            for kw in self.exit_keywords:
-                if kw in text:
-                    logger.info(f"Exit keyword: {kw}", module=self.LOG_MODULE)
-                    return "exit"
-
-            # 4. Send to backend and wait for response
-            full_text = text
-            if self.backend._rule_prompt:
-                full_text = text + "\n" + self.backend._rule_prompt
-            # 先发出请求（不阻塞等回复），立即播"咻"给用户即时反馈，再等回复
-            # 注意：直接用 _send_and_track 而非 send(wait_response=False)，
-            # 后者会立即清掉 Future，导致后续 _wait_response 拿不到回复
-            run_id = await self.backend._send_and_track(full_text)
-            await self._play_send_sound()
-            response = await self.backend._wait_response(run_id) if run_id else None
-            if response is None:
-                logger.warning(f"No response from {self.BACKEND_NAME}", module=self.LOG_MODULE)
-                await self._play_reply_and_resume(
-                    self._cfg("failure_text", "我听到了，但 AI 服务暂时没有返回回答，请稍后再试"), vad
-                )
-                return "continue"
-
-            await self._play_reply_and_resume(str(response), vad)
-
+        text = ASRService.asr(speech_bytes, sample_rate=16000)
+        if barge_in_from is not None:
+            # 补录的开头带着唤醒词（"你好缪斯，明天天气怎么样"），去掉
+            text = self._strip_wake_word(text)
+        if not text or not any(character.isalnum() for character in text):
+            logger.debug("ASR empty, retrying", module=self.LOG_MODULE)
             return "continue"
-        finally:
-            await self._turn_off_light()
+
+        # 3. Check exit keywords
+        for kw in self.exit_keywords:
+            if kw in text:
+                logger.info(f"Exit keyword: {kw}", module=self.LOG_MODULE)
+                return "exit"
+
+        # 4. Send to backend and wait for response
+        full_text = text
+        if self.backend._rule_prompt:
+            full_text = text + "\n" + self.backend._rule_prompt
+        # 先发出请求（不阻塞等回复），立即播"咻"给用户即时反馈，再等回复
+        # 注意：直接用 _send_and_track 而非 send(wait_response=False)，
+        # 后者会立即清掉 Future，导致后续 _wait_response 拿不到回复
+        run_id = await self.backend._send_and_track(full_text)
+        await self._play_send_sound()
+        response = await self.backend._wait_response(run_id) if run_id else None
+        if response is None:
+            logger.warning(f"No response from {self.BACKEND_NAME}", module=self.LOG_MODULE)
+            await self._play_reply_and_resume(
+                self._cfg("failure_text", "我听到了，但 AI 服务暂时没有返回回答，请稍后再试"), vad
+            )
+            return "continue"
+
+        await self._play_reply_and_resume(str(response), vad)
+        return "continue"
 
     async def _run_one_turn_with_xiaoai_asr(self) -> str:
         """Execute a single conversation turn using XiaoAI native ASR."""
@@ -383,27 +376,37 @@ class ExternalConversationController:
                 logger.info(f"Exit keyword: {kw}", module=self.LOG_MODULE)
                 return "exit"
 
-        try:
-            await self._set_light_phase("thinking")
-            full_text = text
-            if self.backend._rule_prompt:
-                full_text = text + "\n" + self.backend._rule_prompt
-            response = await self.backend.send(full_text, wait_response=True)
-            if response is None:
-                logger.warning(f"No response from {self.BACKEND_NAME}", module=self.LOG_MODULE)
-                await self._play_reply_and_resume(
-                    self._cfg("failure_text", "我听到了，但 AI 服务暂时没有返回回答，请稍后再试")
-                )
-                return "continue"
-
-            await self._play_reply_and_resume(str(response))
+        self._light_state("thinking")
+        full_text = text
+        if self.backend._rule_prompt:
+            full_text = text + "\n" + self.backend._rule_prompt
+        response = await self.backend.send(full_text, wait_response=True)
+        if response is None:
+            logger.warning(f"No response from {self.BACKEND_NAME}", module=self.LOG_MODULE)
+            await self._play_reply_and_resume(
+                self._cfg("failure_text", "我听到了，但 AI 服务暂时没有返回回答，请稍后再试")
+            )
             return "continue"
-        finally:
-            await self._turn_off_light()
+
+        await self._play_reply_and_resume(str(response))
+        return "continue"
+
+    @staticmethod
+    def _strip_wake_word(text: str) -> str:
+        """去掉句首的缪斯唤醒词；不含唤醒词时原样返回。"""
+        if not text:
+            return text
+        try:
+            from core.muse import load_settings, match_settings_text
+
+            match = match_settings_text(text, load_settings())
+        except Exception:
+            return text
+        return match.content if match else text
 
     # ---- VAD integration ----
 
-    async def _wait_for_speech(self, vad) -> bytes | None:
+    async def _wait_for_speech(self, vad, preroll_from: int | None = None) -> bytes | None:
         """Use VAD to detect speech and collect complete utterance.
 
         Follows the same two-step pattern as the XiaoZhi wakeup session:
@@ -430,6 +433,7 @@ class ExternalConversationController:
             nonlocal is_recording
             recording_frames.append(speech_buffer)
             is_recording = True
+            self._light_state("hearing")
             logger.debug(f"VAD speech detected, buffer size: {len(speech_buffer)}", module=self.LOG_MODULE)
             # Now wait for silence to know user stopped speaking
             vad.resume("silence")
@@ -464,7 +468,10 @@ class ExternalConversationController:
         vad._handle_silence_frame = _recording_silence_frame
 
         try:
-            vad.resume("speech")
+            if preroll_from is None:
+                vad.resume("speech")
+            else:
+                vad.resume("speech", preroll_from=preroll_from)
             result = await asyncio.wait_for(self._vad_future, timeout=self.timeout)
             return result
 
@@ -588,6 +595,7 @@ class ExternalConversationController:
 
     async def _stop_recording(self):
         """Kill the remote arecord process so the mic doesn't pick up TTS."""
+        self._set_recording_wanted(False)
         try:
             await open_xiaoai_server.stop_recording()
             logger.debug("Recording stopped", module=self.LOG_MODULE)
@@ -596,6 +604,7 @@ class ExternalConversationController:
 
     async def _start_recording(self):
         """Restart the remote arecord process to resume mic input."""
+        self._set_recording_wanted(True)
         try:
             await open_xiaoai_server.start_recording()
             logger.debug("Recording started", module=self.LOG_MODULE)
@@ -605,19 +614,87 @@ class ExternalConversationController:
     # ---- TTS ----
 
     async def _play_reply_and_resume(self, text: str, vad=None):
-        """关麦播报正常或失败回答，切换回答灯，播放结束后恢复下一轮监听。"""
-        await self._stop_recording()
+        """播报回答，结束后恢复下一轮监听。
+
+        回采在线时不关麦，播报中喊唤醒词可以打断：直接进入下一轮，不播提示音。
+        否则关麦播报，播完放提示音再开麦。
+        """
+        barge_in = self._barge_in_ready()
+        interrupted = False
+        if not barge_in:
+            await self._stop_recording()
         try:
-            await self._set_light_phase("speaking")
-            await self._play_tts(text)
+            self._light_state("speaking")
+            if barge_in:
+                interrupted = await self._play_tts_interruptible(text)
+            else:
+                await self._play_tts(text)
         finally:
-            await self._turn_off_light()
-            if self.active:
+            if self.active and not interrupted:
+                self._light_state("listening")
                 await self._play_notify()
-                await self._start_recording()
-        if self.active and vad is not None:
+                if not barge_in:
+                    await self._start_recording()
+        if interrupted or not self.active:
+            return
+        if vad is not None:
             await self._wait_for_silence(vad)
         logger.debug("Ready for next conversation round", module=self.LOG_MODULE)
+
+    async def _play_tts_interruptible(self, text: str) -> bool:
+        """边播报边检测唤醒词；被打断返回 True。"""
+        kws = get_kws()
+        hit = self._loop.create_future()
+
+        def on_hit(keyword, position):  # KWS 线程
+            self._loop.call_soon_threadsafe(self._on_barge_in_hit, hit, keyword, position)
+
+        tts = asyncio.create_task(self._play_tts(text))
+        kws.arm_barge_in(on_hit)
+        try:
+            await asyncio.wait({tts, hit}, return_when=asyncio.FIRST_COMPLETED)
+        except asyncio.CancelledError:
+            tts.cancel()
+            raise
+        finally:
+            kws.disarm_barge_in()
+        if not hit.done() or hit.cancelled():
+            hit.cancel()
+            return False
+
+        keyword, position = hit.result()
+        # 先切灯让用户马上看到打断生效，再停播报
+        self._light_state("listening")
+        token = self._playback_token
+        if token is not None:
+            open_xiaoai_server.stop_tts_playback(token)
+        tts.cancel()
+        await asyncio.gather(tts, return_exceptions=True)
+        speaker = get_speaker()
+        if speaker:
+            self._background(speaker.stop_device_audio())
+        lookback = int(self._barge_cfg("speech_lookback_ms", 350)) * 16
+        self._barge_in_from = max(0, int(position) - lookback)
+        logger.info(f"✋ 打断播报: {keyword}", module=self.LOG_MODULE)
+        return True
+
+    def _on_barge_in_hit(self, hit: asyncio.Future, keyword: str, position: int):
+        """播报中 KWS 命中：确认像真人在喊（near_end_min_db）再打断。"""
+        if hit.done():
+            return
+        xiaoai = get_xiaoai()
+        ratio_fn = getattr(xiaoai, "near_end_ratio_db", None)
+        ratio = ratio_fn() if ratio_fn else None
+        min_db = self._barge_cfg("near_end_min_db", None)
+        ratio_text = "-" if ratio is None else f"{ratio:.1f} dB"
+        if min_db is not None and ratio is not None and ratio < float(min_db):
+            logger.info(
+                f"🙉 忽略疑似音箱自己的声音: {keyword}（近端 {ratio_text} < {min_db} dB）",
+                module=self.LOG_MODULE,
+            )
+            return
+        logger.info(f"Barge-in: {keyword}, near-end {ratio_text}", module=self.LOG_MODULE)
+        hit.set_result((keyword, position))
 
     async def _play_tts(self, text: str):
         """Play text via Doubao TTS (blocks until playback finishes)."""

@@ -1,6 +1,6 @@
 # 迁移方案：把 OwnDing/open-xiaoai 的能力移植进本项目
 
-> 状态：阶段 1 已完成并在真机验证，下一步阶段 3 + 4。最后更新：2026-10-18。
+> 状态：阶段 1、2 已完成并在真机验收，下一步阶段 3 + 4。最后更新：2026-10-18。
 > 参考项目：[OwnDing/open-xiaoai](https://github.com/OwnDing/open-xiaoai)（基于 commit `7ecea6f`，MIT）。
 
 ## 1. 背景与目标
@@ -163,8 +163,8 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
 | 顺序 | 内容 | 原因 |
 |---|---|---|
 | 1 | 阶段 1 | 最大的未知数，不通的话打断功能要重新设计 |
-| 2 | 阶段 3 + 4 | 只改服务端，风险低，见效快 |
-| 3 | 阶段 2 | 依赖阶段 1 |
+| 2 | 阶段 2（已提前完成） | 依赖阶段 1 |
+| 3 | 阶段 3 + 4 | 只改服务端，风险低，见效快 |
 | 4 | 阶段 5 | 改动独立 |
 | 5 | 阶段 6 | 可与 2～4 并行，主要在 Oracle 端 |
 | 6 | 阶段 7 | 收尾 |
@@ -173,7 +173,7 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
 
 1. AgentDock 的 cloudflared 隧道能否另加一个域名。
 2. 勿扰时段：跟随音箱自己的勿扰设置，还是写死时间段。
-3. 回采声道在 ROM 1.62.2 上是否为索引 3（阶段 1 实测）。
+3. ~~回采声道在 ROM 1.62.2 上是否为索引 3~~：已确认（阶段 1）。
 
 ## 7. 进度记录
 
@@ -213,3 +213,29 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
 
 - 2026-10-18：清理小爱管家 webhook（Grok Bot）链路："你好缪斯"固定路由到 `"openai"`（Hermes），删除 webhook 客户端 / 单次处理器 / 追问模块和 mock 脚本。
   已知问题：进入连续对话后会重新听一句，"你好缪斯，开灯"里的"开灯"不会带过去，留到阶段 3 + 4 一起处理。
+- 2026-10-18：修复"你好缪斯"唤醒失效：新客户端 S32 `>> 8` 比旧客户端响约 256 倍，`audio_input.gain` 4.0 → 1.0。
+- 2026-10-18：**阶段 2 完成并真机验收**（打断、补录、灯效）。
+
+### 阶段 2 改动
+
+| 文件 | 改动 |
+|---|---|
+| `core/services/audio/aec.py` | 移植 OwnDing 子带回声消除；加两道保护：前 16 帧只学习不相减、每个频点输出不超过麦克风（不加时每次开始播放前 0.5 秒会放大 15～30 dB） |
+| `core/xiaoai.py` | `mic_ref` 帧先消回声再乘 `echo_mic_gain`；`echo_reference_live` / `echo_active` / `near_end_ratio_db`；录音看门狗（`set_recording_wanted`） |
+| `core/services/audio/stream.py` | `GlobalStream` 保留最近 3 秒、绝对采样位置 `samples`、`since()`；`MyStream.unread_samples()` |
+| `core/services/audio/vad/__init__.py` | `resume(target, preroll_from=)` 补录；回声残留期间用 `echo_vad_threshold` |
+| `core/services/audio/kws/__init__.py` | `arm_barge_in` / `disarm_barge_in`：暂停时仍检测，命中交给打断处理并带上命中位置 |
+| `core/external_conversation.py` | 回采在线时不关麦、可打断、打断后直接下一轮（不播提示音）、去掉补录里的唤醒词；灯效改用 `ConversationLight` |
+| `core/services/conversation_light.py` | 状态驱动灯效，替代 `listening_light.py` |
+| `config.py` | `barge_in.enabled` / `echo_reference` 打开；`speech_lookback_ms`、`echo_vad_threshold`、`near_end_min_db`、`echo_canceller`；`listening_light.hearing_effect_id` |
+
+验证：
+
+- 阶段 1 的真机双声道录音离线回放：开始学习后每次播放开头即消 22～27 dB（软件启动后第一次播放约 6 dB），CPU 1～4%。
+- 真机：音箱自己念 4 遍"你好缪斯 / 嗨缪斯 / hey muse"未自唤醒；用户实测打断、补录、灯效通过。
+
+未做 / 留到后面：
+
+- `near_end_min_db` 先不设门限，每次打断的近端 dB 写在日志里，积累数据后再定。
+- 播完后的提示音和 `_wait_for_silence` 仍在（阶段 4）。
+- `tests/test_echo_ref_input.py::test_mic_ref_keeps_mic_channel_with_gain` 仍按"直接乘 64"断言，需按回声消除的 1024 采样延迟改写。

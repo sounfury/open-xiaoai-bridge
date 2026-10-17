@@ -223,12 +223,29 @@ APP_CONFIG = {
         "gain": 1.0,
     },
     "barge_in": {
-        # 让音箱同时发回正在播放的声音（[麦克风, 播放回采] 双声道），用于回声消除和播报中打断。
+        # 播报时喊唤醒词（如"你好缪斯"）可以打断，然后直接说新的问题（需要 echo_reference）。
+        # 回采不在线（旧客户端 / 连接刚建立）时自动退回"关麦播报"。
+        "enabled": True,
+        # 让音箱同时发回正在播放的声音（[麦克风, 播放回采] 双声道），bridge 据此消除回声。
         # 需要 OwnDing 版客户端（client-2026.10.09+）；只在 OH2P 上验证过。
-        # 阶段 1 只取麦克风声道，回声消除在阶段 2 接入。环境变量 BARGE_IN_ECHO_REFERENCE=1/0 可临时覆盖。
-        "echo_reference": False,
-        # 双声道里麦克风声道电平偏低，乘这个倍数回到单声道录音的电平（之后再乘 audio_input.gain）
+        # 环境变量 BARGE_IN_ECHO_REFERENCE=1/0 可临时覆盖。
+        "echo_reference": True,
+        # 双声道里麦克风声道电平偏低，消除回声后乘这个倍数回到单声道录音的电平（之后再乘 audio_input.gain）
         "echo_mic_gain": 64,
+        # 打断后补录：从唤醒词结束前这么多毫秒开始，接上"你好缪斯，明天天气怎么样"里后半句（ms）
+        "speech_lookback_ms": 350,
+        # 刚播放过声音的那一小段（播放中、停播后 echo_vad_hangover_ms 内），消除后剩下的残留
+        # 仍可能被当成说话；这段时间里说话判定用这个更高的阈值（真人说话约 1.0）。None = 不提高
+        "echo_vad_threshold": 0.7,
+        "echo_vad_hangover_ms": 300,
+        # 打断时比较"消除回声后剩下的声音"和"消掉的回声"（dB）。设成数字（如 -17）后，
+        # 低于它的唤醒当作音箱自己的声音忽略；None 只记日志。
+        "near_end_min_db": None,
+        # 回声消除器（core/services/audio/aec.py）
+        "echo_canceller": {
+            "taps": 8,  # 回声尾巴长度（帧，每帧 16 ms）
+            "tau_s": 3.0,  # 回声路径估计的平均时长（秒）
+        },
         # OH2P 的 hw:0,3（共享名 Capture）：4 声道 48 kHz，ch0 麦克风，ch3 播放回采
         "capture": {
             "pcm": "Capture",
@@ -343,10 +360,11 @@ APP_CONFIG = {
         "api_key": "",
         "model": "muse-home",
         "listening_light": {
-            "enabled": True,  # 连续对话按监听、思考、回答阶段切换，退出或中断时清理
+            "enabled": True,  # 等你说 9 → 听到你在说 41 → 思考 2 → 播报 3，退出时熄灭（见 core/services/conversation_light.py）
             "effect_id": 9,  # OH2P 固件 noangle 监听灯效
+            "hearing_effect_id": 41,  # 听到你在说：固件 wakeup.sh 的 asrstart 灯效
             "thinking_effect_id": 2,  # 固件 wakeup.sh 的 think 灯效
-            "speaking_effect_id": 3,  # 固件 wakeup.sh 的 speek 灯效
+            "speaking_effect_id": 3,  # 播报中（可打断）：固件 wakeup.sh 的 speek 灯效
         },
         "failure_text": "我听到了，但缪斯服务暂时没有返回回答，请稍后再试",
         # 输入模式：

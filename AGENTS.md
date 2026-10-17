@@ -19,6 +19,7 @@ open-xiaoai-bridge/
 │   ├── xiaoai_conversation.py     # 小爱连续对话策略
 │   ├── xiaozhi.py                 # 小智 AI WebSocket 协议客户端
 │   ├── openclaw.py                # OpenClaw 网关客户端（连接、消息、TTS 播放）
+│   ├── external_conversation.py   # 外部后端连续对话基类（VAD → ASR → Agent → TTS，播报中打断）
 │   ├── openclaw_conversation.py   # OpenClaw 连续对话循环（VAD → ASR → Agent → TTS）
 │   ├── wakeup_session.py          # 小智唤醒会话状态机
 │   ├── muse.py                    # 小爱管家（你好缪斯）唤醒词：集合、文本解析、KWS 子集、拦截原生小爱
@@ -28,9 +29,11 @@ open-xiaoai-bridge/
 │   ├── services/
 │   │   ├── speaker.py             # SpeakerManager 音箱硬件控制
 │   │   ├── api_server.py          # HTTP REST API（aiohttp）
+│   │   ├── conversation_light.py  # 连续对话灯效（状态驱动、后台切换）
 │   │   ├── tts/router.py           # 统一 TTS provider 路由与播放
 │   │   ├── audio/
-│   │   │   ├── stream.py          # GlobalStream 全局音频流（多路输入广播）
+│   │   │   ├── stream.py          # GlobalStream 全局音频流（多路输入广播，保留最近 3 秒）
+│   │   │   ├── aec.py             # 子带回声消除（移植自 OwnDing/open-xiaoai）
 │   │   │   ├── codec.py           # 音频编解码
 │   │   │   ├── vad/silero.py      # Silero VAD 语音活动检测（ONNX）
 │   │   │   ├── kws/sherpa.py      # Sherpa KWS 关键词唤醒
@@ -86,6 +89,9 @@ open-xiaoai-bridge/
 - `init_xiaoai()` → 初始化原生服务，注册事件处理
 - `on_event(event)` → 处理小爱事件（RecognizeResult / AudioPlayer）
 - `on_input_data(data)` / `on_output_data(data)` → 麦克风 / 扬声器音频回调
+- `on_input_packet((data, metadata))` → 新客户端录音帧；`layout == "mic_ref"`（[麦克风, 播放回采] 双声道）时先过回声消除，再按单声道送进 `GlobalStream`
+- `echo_reference_live()` / `echo_active()` / `near_end_ratio_db()` → 回采是否在线、当前输入是否可能带播放残留、打断时近端人声强度
+- `set_recording_wanted(wanted)` → 会话层主动关麦时置 False；录音看门狗只在"应该有录音"且断流 4 秒后重新请求录音
 - `run_shell(script, timeout)` → 远端 shell 执行
 - 内部维护独立 `async_loop`（后台线程），仅用于原生扩展回调和事件桥接
 
@@ -144,13 +150,19 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 3. SherpaASR 离线识别
 4. 退出关键词检测
 5. 发送到 OpenClaw
-6. TTS 播放回复（阻塞等待完成）
+6. TTS 播放回复（等待完成，或被唤醒词打断）
 7. 恢复监听
 
-**回声防护机制**:
-- `stop_recording` → kill 远端 arecord → 麦克风物理静音
-- TTS 和提示音都在关麦期间播放，开麦后 VAD 从干净状态开始检测
-- `VAD.resume()` 会自动 `_reset_state()` + `input_bytes.clear()`，清除旧的 `speech_frames` 和音频流缓冲
+**回声防护与播报中打断**（`barge_in` 配置，实现在 `core/external_conversation.py`）:
+- 回采在线（`barge_in.enabled` 且 `XiaoAI.echo_reference_live()`）时：播报期间**不关麦**，回声由 `core/services/audio/aec.py` 消除；KWS 通过 `arm_barge_in(handler)` 在暂停状态下继续检测，命中后先切灯，再用自己持有的 `playback_token` 停 TTS、后台 `stop_device_audio()`，直接进入下一轮（不播提示音）
+- 打断命中位置（`GlobalStream` 绝对采样位置）往前 `speech_lookback_ms` 作为下一轮 `VAD.resume("speech", preroll_from=...)` 的预录，"你好缪斯，明天天气怎么样"后半句不丢；ASR 结果去掉句首唤醒词
+- 回声残留期间（播放中及停播后 `echo_vad_hangover_ms`）VAD 用更高的 `echo_vad_threshold`
+- 回采不在线时退回旧方式：`stop_recording` → kill 远端 arecord → 麦克风物理静音，TTS 和提示音都在关麦期间播放
+- `VAD.resume()` 会自动 `_reset_state()` + `input_bytes.clear()`，清除旧的 `speech_frames` 和音频流缓冲（带 `preroll_from` 时再从 `GlobalStream` 历史补回）
+
+**灯效**（`core/services/conversation_light.py`）:
+- 会话只调用 `_light_state(state)`：`listening` 9 → `hearing` 41（VAD 判定开口）→ `thinking` 2 → `speaking` 3 → `off`
+- 后台任务按最新状态切灯，不阻塞语音流程；`set()` 可在 VAD/KWS 线程调用
 
 **VAD 状态泄漏陷阱**:
 - VAD 检测循环持续运行，`speech_frames` 会不断积累音频帧
@@ -159,7 +171,8 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 
 **边界约束**:
 - 使用独立 VAD Future，不与 WakeupSessionManager 冲突
-- TTS 完全阻塞，播放完成后才继续监听
+- 播报被等待完成后才继续监听；唯一的提前结束方式是打断（或 `stop()`）
+- 主动关麦（`_stop_recording`）必须同时 `set_recording_wanted(False)`，否则录音看门狗会在播报中重新打开麦克风；会话结束时恢复为 True
 - 自己持有并管理当前 TTS 的 `playback_token`；停止 OpenClaw 对话时应调用 `stop_tts_playback(token)`，不要在外层直接无 token 全局停止 Rust TTS
 
 ### WakeupSessionManager (core/wakeup_session.py)
@@ -320,22 +333,7 @@ API_SERVER_ENABLE=1 uv run main.py
 - `scripts/start.sh` 在仅小爱模式下不应检查 `core/models/` 下的模型文件
 
 ## 测试
-
-```bash
-# 无音箱流式冒烟测试
-python3 tests/test_tts_stream.py
-
-# 比较长文本 mp3/pcm 流式时延
-python3 tests/test_tts_latency.py --formats mp3,pcm --rounds 3 --repeat 8
-
-# OpenClaw 连通性测试
-python3 tests/test_openclaw_live_connectivity.py
-
-# 小爱管家唤醒词 / API 鉴权（无音箱、无原生扩展）
-python3 -m pytest tests/test_muse*.py tests/test_api_server.py
-```
-
-注意：`DoubaoTTS` 在类定义时调用 `ConfigManager.instance()`，真实实例会把 `DEVICE_ID` 写回当前目录的 `config.py`；新测试导入相关模块时应先 stub `ConfigManager.instance`。
+不写任何单测，直接连接音箱做验收测试
 
 ## 音箱设备控制命令
 
@@ -372,7 +370,7 @@ python3 -m pytest tests/test_muse*.py tests/test_api_server.py
 | 停止录音 | `open_xiaoai_server.stop_recording()` | 杀掉设备端 `arecord` 进程，麦克风静音 |
 | 恢复录音 | `open_xiaoai_server.start_recording()` | 重启 `arecord`，音频数据恢复流入 `GlobalStream` |
 
-**注意**：OpenClaw 对话中 TTS 播放时会 `stop_recording` 防止回声。如果在此期间触发中断（"小爱同学"），必须在中断处理中调用 `start_recording` 恢复录音，否则 KWS 将因无音频数据而永久失效。
+**注意**：回采不在线时，对话中 TTS 播放会 `stop_recording` 防止回声（回采在线时不关麦）。如果在此期间触发中断（"小爱同学"），必须在中断处理中调用 `start_recording` 恢复录音，否则 KWS 将因无音频数据而永久失效。
 
 ### on_interrupt 中断处理要点
 

@@ -2,10 +2,19 @@ import uuid
 from typing import Any, Callable, ClassVar, Optional
 
 
+# 全局流保留最近这么多秒的输入，用于打断后把唤醒词之后已经说出的话补给 VAD
+HISTORY_SECONDS = 3
+_BYTES_PER_SAMPLE = 2  # 16 kHz 单声道 int16
+
+
 class __GlobalStream:
     def __init__(self):
         self.readers = {}
         self.on_output_data = None
+        # 累计输入的采样数（16 kHz），用作绝对位置
+        self.samples = 0
+        self._history = bytearray()
+        self._history_limit = HISTORY_SECONDS * 16000 * _BYTES_PER_SAMPLE
 
     def register_reader(self, reader):
         if reader.id not in self.readers:
@@ -16,8 +25,21 @@ class __GlobalStream:
             del self.readers[reader.id]
 
     def input(self, data: bytes) -> None:
-        for key in self.readers:
-            self.readers[key].input(data)
+        self._history.extend(data)
+        overflow = len(self._history) - self._history_limit
+        if overflow > 0:
+            del self._history[:overflow]
+        self.samples += len(data) // _BYTES_PER_SAMPLE
+        for key in list(self.readers):
+            reader = self.readers.get(key)
+            if reader is not None:
+                reader.input(data)
+
+    def since(self, sample: int) -> bytes:
+        """从绝对位置 sample 到现在的输入；超出保留范围的部分丢弃。"""
+        count = max(0, self.samples - max(0, int(sample)))
+        size = min(count * _BYTES_PER_SAMPLE, len(self._history))
+        return bytes(self._history[len(self._history) - size :]) if size else b""
 
     def output(self, frames: bytes) -> None:
         if self.on_output_data:
@@ -58,6 +80,10 @@ class MyStream:
 
     def is_active(self) -> bool:
         return self._is_active
+
+    def unread_samples(self) -> int:
+        """已收到但还没被 read() 取走的采样数。"""
+        return max(0, len(self.input_bytes) - self._read_offset) // 2
 
     def clear_input(self) -> None:
         """Drop all buffered input and reset the read cursor.

@@ -1,8 +1,8 @@
 import threading
 import time
 
-from core.ref import set_vad
-from core.services.audio.stream import MyAudio
+from core.ref import get_xiaoai, set_vad
+from core.services.audio.stream import GlobalStream, MyAudio
 from core.services.audio.vad.silero import Silero
 from core.services.protocols.typing import AudioConfig
 from core.utils.config import ConfigManager
@@ -21,6 +21,8 @@ class _VAD:
         self.threshold = 0.01
         self.min_speech_duration = 250
         self.min_silence_duration = 500
+        # 刚播放过声音时（回声消除后仍有残留），说话判定用这个更高的阈值；None = 不提高
+        self.echo_threshold = None
 
         # 状态变量
         self.paused = True
@@ -45,6 +47,8 @@ class _VAD:
         self.threshold = config.get("threshold", 0.01)
         self.min_speech_duration = config.get("min_speech_duration", 250)
         self.min_silence_duration = config.get("min_silence_duration", 500)
+        echo = self.config_manager.get_app_config("barge_in.echo_vad_threshold", None)
+        self.echo_threshold = None if echo is None else float(echo)
 
     def _on_config_reload(self, *_args):
         """配置重载后刷新运行时参数。"""
@@ -74,13 +78,30 @@ class _VAD:
         self._reset_state()
         self.stream.stop_stream()
 
-    def resume(self, target: str):
-        """恢复VAD检测"""
+    def resume(self, target: str, preroll_from: int | None = None):
+        """恢复VAD检测
+
+        preroll_from: GlobalStream 的绝对采样位置。设置后，从该位置到现在已经收到的
+        音频会作为"说话前的静音片段"放在开头（打断后补回唤醒词之后已经说出的话）。
+        """
         self.paused = False
         self.target = target
         self._reset_state()
         self.stream.clear_input()  # discard stale audio + reset read cursor
+        if preroll_from is not None and target == "speech":
+            preroll = GlobalStream.since(preroll_from)
+            self.silence_frames = list(preroll[-2 * self.sample_rate :])
         self.stream.start_stream()
+
+    def _speech_threshold(self) -> float:
+        """回声残留期间提高说话判定阈值。"""
+        if self.echo_threshold is None:
+            return self.threshold
+        xiaoai = get_xiaoai()
+        echo_active = getattr(xiaoai, "echo_active", None)
+        if echo_active and echo_active():
+            return max(self.threshold, self.echo_threshold)
+        return self.threshold
 
     def _handle_speech_frame(self, frames):
         """处理语音帧"""
@@ -181,7 +202,7 @@ class _VAD:
 
             # 检测是否是语音
             speech_prob = Silero.vad(frames, self.sample_rate) or 0
-            is_speech = speech_prob >= self.threshold
+            is_speech = speech_prob >= self._speech_threshold()
             if is_speech:
                 self._handle_speech_frame(frames)
             else:

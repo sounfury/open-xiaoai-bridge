@@ -16,12 +16,13 @@ All notable changes to this project will be documented in this file.
 - 关键词生成（`core/services/audio/kws/keywords.py`）改为逐条编码：含模型词表外字符的关键词跳过并告警（`sherpa_onnx.text2token` 原本会静默丢弃），全部失败时返回非零；关键词先做 NFKC 再转大写。
 - HTTP API 新增可选 Bearer 鉴权：设置 `API_SERVER_TOKEN` 后 `/api/*`（`/api/health` 除外）需携带 `Authorization: Bearer <token>`；未设置时行为不变。`skills/xiaoai-tts` 支持 `OPENXIAOAI_API_TOKEN`。
 - `/api/play/text` 支持可选 `request_id` 字段（写入日志并原样返回）。
-- 外部对话后端按监听 / 思考 / 回答切换 OH2P 灯效（`listening_light`）。
-- `native/` 改用 OwnDing/open-xiaoai 的 crate（需要配套的 OwnDing 音箱客户端 `client-2026.10.09`+，旧客户端不兼容）：二进制音频帧、新连接接管旧连接、快速重连不重复播"已连接"；可选请求播放回采（`barge_in.echo_reference`，默认关闭），为播报中打断做准备。见 `docs/ownding-migration-plan.md`。
+- 连续对话灯效改为状态驱动、后台切换（`core/services/conversation_light.py`，替代 `listening_light.py`）：等你说 9 → 听到你在说 41 → 思考 2 → 播报 3 → 退出熄灭；切灯不再阻塞开始听。
+- 播报中打断（`barge_in.enabled`，需要回采）：音箱发回播放回采，bridge 用子带回声消除（移植自 OwnDing，加了起步发散和放大保护）去掉回声；播报时不关麦，喊唤醒词立即停播并直接进入下一轮，唤醒词后紧接着说的话会补录。回采不在线时自动退回关麦播报。新增录音看门狗（断流 4 秒重新请求录音，主动关麦期间不触发）。
+- `native/` 改用 OwnDing/open-xiaoai 的 crate（需要配套的 OwnDing 音箱客户端 `client-2026.10.09`+，旧客户端不兼容）：二进制音频帧、新连接接管旧连接、快速重连不重复播"已连接"；可请求播放回采（`barge_in.echo_reference`）。`audio_input.gain` 随之改回 1.0（新客户端电平高约 256 倍）。见 `docs/ownding-migration-plan.md`。
 
 ### 开发与测试
 
-- 新增 `tests/test_muse.py`、`tests/test_muse_wake_words.py`、`tests/test_api_server.py`、`tests/test_listening_light.py`、`tests/test_echo_ref_input.py`，无需音箱、原生扩展与模型。
+- 新增 `tests/test_muse.py`、`tests/test_muse_wake_words.py`、`tests/test_api_server.py`、`tests/test_conversation_light.py`、`tests/test_echo_ref_input.py`，无需音箱、原生扩展与模型。
 
 ## v1.0.7 - 2026-07-14
 

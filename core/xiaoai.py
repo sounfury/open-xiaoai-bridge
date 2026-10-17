@@ -8,7 +8,7 @@ import wave
 import numpy as np
 import open_xiaoai_server
 
-from core.ref import get_speaker, set_xiaoai
+from core.ref import get_app, get_speaker, set_xiaoai
 from core.services.audio.stream import GlobalStream
 from core.services.speaker import SpeakerManager
 from core.wakeup_session import EventManager
@@ -37,6 +37,11 @@ DEFAULT_ECHO_CAPTURE = {
     "mic_shift": 14,
     "ref_shift": 16,
 }
+# 超过这么久没有双声道录音，视为音箱已不发送回采（不能打断）
+ECHO_REFERENCE_STALE_S = 2.0
+# 录音看门狗：每隔多久检查一次；连接还在但超过多久没有音频就重新请求录音
+RECORDING_WATCHDOG_INTERVAL_S = 5.0
+RECORDING_STALL_S = 4.0
 
 
 class XiaoAI:
@@ -49,6 +54,14 @@ class XiaoAI:
     # 双声道录音里麦克风声道的电平比单声道录音低，乘这个倍数回到原来的电平
     _echo_mic_gain = 64.0
     _echo_dump: dict | None = None
+    # 回声消除器（收到第一帧双声道录音时创建），见 core/services/audio/aec.py
+    echo = None
+    _echo_seen: float | None = None  # 最近一次收到双声道录音（monotonic）
+    _echo_until = 0.0  # 这个时间之前的输入可能还带着（消除后的）播放残留
+    # 录音看门狗
+    _last_input_at: float | None = None
+    _recording_wanted = True
+    _watchdog_thread: threading.Thread | None = None
     _async_loop_ready = threading.Event()
     _external_wakeup_keywords: set[str] = set()
     _muse_wakeup_keywords: set[str] = set()
@@ -150,8 +163,7 @@ class XiaoAI:
     def on_input_packet(cls, packet):
         """新客户端的录音帧：(PCM bytes, metadata JSON)。
 
-        双声道 [麦克风, 播放回采]（layout=mic_ref）时，阶段 1 只取麦克风声道，
-        回声消除在阶段 2 接入。
+        双声道 [麦克风, 播放回采]（layout=mic_ref）时先消除回声，再按单声道送进 GlobalStream。
         """
         data, metadata = packet
         try:
@@ -162,9 +174,95 @@ class XiaoAI:
             frames = np.frombuffer(data, dtype="<i2").reshape(-1, 2)
             if cls._echo_dump is not None:
                 cls._append_echo_dump(frames)
-            mic = frames[:, 0].astype(np.float32) * cls._echo_mic_gain
-            data = np.clip(np.round(mic), -32768, 32767).astype(np.int16).tobytes()
+            data = cls._cancel_echo(frames)
         cls.on_input_data(data)
+
+    @classmethod
+    def _cancel_echo(cls, frames) -> bytes:
+        """[麦克风, 回采] → 消除回声后的单声道 S16，电平与单声道录音一致。"""
+        from core.services.audio.aec import SubbandEchoCanceller
+
+        barge_in = cls.config_manager.get_app_config("barge_in", {}) or {}
+        if cls.echo is None:
+            settings = barge_in.get("echo_canceller") or {}
+            cls.echo = SubbandEchoCanceller(
+                taps=int(settings.get("taps", 8)),
+                tau_s=float(settings.get("tau_s", 3.0)),
+            )
+        now = time.monotonic()
+        cls._echo_seen = now
+        cleaned = cls.echo.process(frames[:, 0], frames[:, 1]) * cls._echo_mic_gain
+        if np.any(frames[:, 1]):
+            # 这一包的回声在消除器延迟之后才输出，房间里还会再响一小会
+            hangover_s = float(barge_in.get("echo_vad_hangover_ms", 300)) / 1000
+            delay_s = (len(frames) + cls.echo.delay) / 16000
+            cls._echo_until = now + delay_s + hangover_s
+        return np.clip(np.round(cleaned), -32768, 32767).astype(np.int16).tobytes()
+
+    @classmethod
+    def echo_reference_live(cls) -> bool:
+        """音箱正在发送回采（最近 2 秒内收到过双声道录音）。"""
+        seen = cls._echo_seen
+        return seen is not None and time.monotonic() - seen < ECHO_REFERENCE_STALE_S
+
+    @classmethod
+    def echo_active(cls) -> bool:
+        """当前输入可能还带着播放残留（正在播放或刚停）。"""
+        return cls.echo_reference_live() and time.monotonic() < cls._echo_until
+
+    @classmethod
+    def near_end_ratio_db(cls) -> float | None:
+        """最近 1.5 秒里，消除回声后最响的一段比被消掉的回声高多少 dB（判断是不是真人在喊）。"""
+        echo = cls.echo
+        return echo.near_end_ratio_db() if echo is not None else None
+
+    # ---- 录音看门狗 ----
+
+    @classmethod
+    def set_recording_wanted(cls, wanted: bool):
+        """会话层主动关麦时置 False，看门狗不会把麦克风重新打开。"""
+        cls._recording_wanted = bool(wanted)
+        if wanted:
+            cls._last_input_at = time.monotonic()
+
+    @classmethod
+    def _start_recording_watchdog(cls):
+        if cls._watchdog_thread is not None:
+            return
+        cls._watchdog_thread = threading.Thread(
+            target=cls._recording_watchdog, daemon=True, name="recording-watchdog"
+        )
+        cls._watchdog_thread.start()
+
+    @classmethod
+    def _recording_watchdog(cls):
+        """录音断流（连接还在但几秒没有音频）时重新请求录音。"""
+        stalled_logged = False
+        while True:
+            time.sleep(RECORDING_WATCHDOG_INTERVAL_S)
+            last = cls._last_input_at
+            if last is None or not cls._recording_wanted:
+                stalled_logged = False
+                continue
+            idle = time.monotonic() - last
+            if idle < RECORDING_STALL_S:
+                stalled_logged = False
+                continue
+            app = get_app()
+            loop = getattr(app, "loop", None)
+            if loop is None or not loop.is_running():
+                continue
+            log = logger.debug if stalled_logged else logger.warning
+            log(f"[XiaoAI] {idle:.0f}s 没有收到录音，重新请求录音")
+            stalled_logged = True
+            asyncio.run_coroutine_threadsafe(cls._restart_recording(), loop)
+
+    @staticmethod
+    async def _restart_recording():
+        try:
+            await open_xiaoai_server.start_recording()
+        except Exception as exc:
+            logger.debug(f"[XiaoAI] 看门狗重新请求录音失败: {exc}")
 
     @classmethod
     def _setup_echo_reference(cls):
@@ -227,6 +325,7 @@ class XiaoAI:
 
     @classmethod
     def on_input_data(cls, data: bytes):
+        cls._last_input_at = time.monotonic()
         audio_array = np.frombuffer(data, dtype=np.int16)
         if cls._input_gain_enabled and audio_array.size > 0:
             boosted = audio_array.astype(np.float32) * cls._input_gain
@@ -428,6 +527,7 @@ class XiaoAI:
         open_xiaoai_server.register_fn("on_input_packet", cls.on_input_packet)
         open_xiaoai_server.register_fn("on_event", cls.__on_event)
         cls.__init_background_event_loop()
+        cls._start_recording_watchdog()
         logger.info("[XiaoAI] 启动小爱音箱服务...")
         print(ASCII_BANNER)
         await open_xiaoai_server.start_server()

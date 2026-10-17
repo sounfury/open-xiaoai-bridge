@@ -7,7 +7,7 @@ import time
 
 from core.ref import get_app, get_xiaoai, get_xiaozhi, set_kws
 from core.services.audio.kws.sherpa import SherpaOnnx
-from core.services.audio.stream import MyAudio
+from core.services.audio.stream import GlobalStream, MyAudio
 from core.services.audio.vad.silero import Silero
 from core.services.protocols.typing import AudioConfig, DeviceState
 from core.utils.config import ConfigManager
@@ -32,6 +32,9 @@ class _KWS:
         self.frame_size = 512
         self.sample_rate = 16000
         self.frame_duration_ms = (self.frame_size * 1000) / self.sample_rate  # 32ms per frame
+        self.paused = False
+        self._barge_in_handler = None
+        self._barge_in_reset = False
 
         self.apply_runtime_config()
         self.config_manager.add_reload_listener(self._on_config_reload)
@@ -63,6 +66,9 @@ class _KWS:
 
         # 启动 KWS 服务
         self.paused = False
+        # 播报中打断：设置后即使 paused 也继续检测，命中交给它而不是 EventManager.wakeup
+        self._barge_in_handler = None
+        self._barge_in_reset = False
         self.thread = threading.Thread(target=self._detection_loop, daemon=True)
         self.thread.start()
         config = ConfigManager.instance()
@@ -80,6 +86,32 @@ class _KWS:
 
     def resume(self):
         self.paused = False
+
+    def arm_barge_in(self, handler):
+        """播报期间检测唤醒词，用来打断播报。
+
+        handler(text, position) 在 KWS 线程里调用；position 是唤醒词大约结束时
+        GlobalStream 的绝对采样位置。命中后保持武装，由调用方 disarm。
+        """
+        self._barge_in_reset = True
+        self._barge_in_handler = handler
+
+    def disarm_barge_in(self):
+        self._barge_in_handler = None
+        self._barge_in_reset = True
+
+    def _dispatch(self, text: str):
+        """命中唤醒词：播报中打断时交给打断处理，否则按普通唤醒派发。"""
+        handler = getattr(self, "_barge_in_handler", None)
+        if handler is not None:
+            # 唤醒词大约在已读到的位置结束：全局流的总采样数减去还没读的
+            position = GlobalStream.samples - self.stream.unread_samples()
+            try:
+                handler(text, position)
+            except Exception as exc:
+                logger.error(f"[KWS] Barge-in handler failed: {type(exc).__name__}: {exc}")
+            return
+        self.on_message(text)
 
     def on_message(self, text: str):
         loop = get_app().loop if get_app() else get_xiaoai().async_loop
@@ -112,11 +144,18 @@ class _KWS:
                 time.sleep(0.01)
                 continue
 
-            # 在说话和监听状态时，暂停 KWS
+            # 武装/解除打断检测时清掉上一段的识别状态，避免旧音频拼进新的检测
+            if self._barge_in_reset:
+                self._barge_in_reset = False
+                self.vad_active = False
+                self.vad_silence_frames = 0
+                SherpaOnnx.reset()
+
+            # 在说话和监听状态时，暂停 KWS（播报中打断检测除外）
             xiaozhi = get_xiaozhi()
             if (
                 not frames
-                or self.paused
+                or (self.paused and self._barge_in_handler is None)
                 or (
                     xiaozhi and xiaozhi.device_state
                     in [DeviceState.LISTENING, DeviceState.SPEAKING]
@@ -142,7 +181,7 @@ class _KWS:
                 result = SherpaOnnx.kws(frames)
                 if result:
                     logger.wakeup(result, module="KWS")
-                    self.on_message(result)
+                    self._dispatch(result)
                     # 唤醒后重置状态
                     self.vad_active = False
                     self.vad_silence_frames = 0
@@ -158,7 +197,7 @@ class _KWS:
                         result = SherpaOnnx.kws(frames)
                         if result:
                             logger.wakeup(result, module="KWS")
-                            self.on_message(result)
+                            self._dispatch(result)
                             self.vad_active = False
                             self.vad_silence_frames = 0
                     else:
