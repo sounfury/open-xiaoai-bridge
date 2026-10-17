@@ -22,7 +22,6 @@ class WakeupSessionManager:
         self._openai_task: asyncio.Task | None = None
         self._qwenpaw_controller = None
         self._qwenpaw_task: asyncio.Task | None = None
-        self._muse_handler = None
         self._xiaozhi_future: asyncio.Future | None = None
 
     def _get_loop(self):
@@ -77,9 +76,6 @@ class WakeupSessionManager:
             self._qwenpaw_controller.stop()
         if self._qwenpaw_task and not self._qwenpaw_task.done():
             loop.call_soon_threadsafe(self._qwenpaw_task.cancel)
-        # Muse: only stop a pending follow-up capture; an in-flight webhook POST keeps going
-        if self._muse_handler:
-            self._muse_handler.stop()
 
         asyncio.run_coroutine_threadsafe(self._stop_device_playback(), loop)
 
@@ -122,7 +118,6 @@ class WakeupSessionManager:
             self._openclaw_controller,
             self._openai_controller,
             self._qwenpaw_controller,
-            self._muse_handler,
         ):
             if controller and controller.is_active():
                 return controller.consume_xiaoai_recognize_result(
@@ -178,20 +173,6 @@ class WakeupSessionManager:
             await self._start_qwenpaw_conversation()
         elif should_wakeup == "xiaozhi":
             self.on_wakeup()
-        elif should_wakeup == "muse":
-            await self._start_muse_request(text, source)
-
-    async def _start_muse_request(self, text, source):
-        """Run a one-shot 小爱管家 (muse) webhook request, see core/muse.py."""
-        from core.muse import MuseRequestHandler
-
-        handler = MuseRequestHandler()
-        self._muse_handler = handler
-        try:
-            await handler.handle(text, source)
-        finally:
-            if self._muse_handler is handler:
-                self._muse_handler = None
 
     async def _start_openclaw_conversation(self):
         """Start an OpenClaw continuous conversation session.
@@ -296,8 +277,6 @@ class WakeupSessionManager:
             self._openai_controller.stop()
         if self._qwenpaw_controller and self._qwenpaw_controller.is_active():
             self._qwenpaw_controller.stop()
-        if self._muse_handler:
-            self._muse_handler.stop()
 
         # Stop all audio playback on the device
         await self._stop_device_playback()

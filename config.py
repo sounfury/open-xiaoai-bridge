@@ -35,7 +35,6 @@ async def before_wakeup(speaker, text, source, app):
         "openai"   — 进入 OpenAI 兼容服务连续对话流程（例如 Hermes Agent API Server）
         "qwenpaw"  — 进入 QwenPaw 连续对话流程
         "xiaozhi"  — 进入小智 AI 流程
-        "muse"     — 单次转发到小爱管家 webhook（需 MUSE_ENABLE=1，见 core/muse.py）
         None       — 不做额外处理（可在此自行调用 app.send_to_openclaw 等）
 
     ---
@@ -45,18 +44,14 @@ async def before_wakeup(speaker, text, source, app):
             app.set_openclaw_session_key("agent:main:xxx")
         不调用则自动使用 openclaw.session_key 的默认值，无需手动重置。
     """
-    # --- 小爱管家："你好缪斯" → 先播"稍等"，再转发到 webhook（MUSE_ENABLE 未开启时不生效）---
+    # --- 小爱管家："你好缪斯" → OpenAI 兼容服务（Hermes）连续对话（需 MUSE_ENABLE=1 和 OPENAI_ENABLE=1）---
     # KWS 命中唤醒词，或小爱 ASR 文本以 muse.wake_words 中任一项开头（如"你好缪斯，我今晚想洗澡"、"Hey Muse，开灯"）
     from core.muse import match_muse_text, suppress_native_xiaoai
 
     if match_muse_text(text):
         if source == "xiaoai":
             await suppress_native_xiaoai(speaker)  # 拦截原生小爱对这句话的处理
-        # OPENAI_ENABLE=1 时走 Hermes 连续对话，不再打小爱管家 webhook
-        import os
-        if os.environ.get("OPENAI_ENABLE", "").lower() in ("1", "true", "yes"):
-            return "openai"
-        return "muse"
+        return "openai"
 
     if source == "kws":
         # --- 示例一：按唤醒词路由到不同 Agent ---
@@ -303,7 +298,7 @@ APP_CONFIG = {
         "token": "your_openclaw_token",  # OpenClaw 认证令牌
         "listening_light": {
             "enabled": True,  # 每轮本地监听时亮灯，结束或中断时熄灯
-            "effect_id": 9,  # 复用 Muse / OpenAI 已验证的 OH2P 监听灯效
+            "effect_id": 9,  # OH2P 固件 noangle 监听灯效，已在 OpenAI 对话里验证
         },
         # 输入模式：
         #   - "local_asr": 现有链路，使用本地 VAD + SherpaASR
@@ -347,7 +342,7 @@ APP_CONFIG = {
         "model": "muse-home",
         "listening_light": {
             "enabled": True,  # 连续对话按监听、思考、回答阶段切换，退出或中断时清理
-            "effect_id": 9,  # 复用 Muse 已验证的 OH2P 监听灯效
+            "effect_id": 9,  # OH2P 固件 noangle 监听灯效
             "thinking_effect_id": 2,  # 固件 wakeup.sh 的 think 灯效
             "speaking_effect_id": 3,  # 固件 wakeup.sh 的 speek 灯效
         },
@@ -386,7 +381,7 @@ APP_CONFIG = {
         "user_id": "open-xiaoai-bridge",
         "listening_light": {
             "enabled": True,  # 每轮本地监听时亮灯，结束或中断时熄灯
-            "effect_id": 9,  # 复用 Muse / OpenAI 已验证的 OH2P 监听灯效
+            "effect_id": 9,  # OH2P 固件 noangle 监听灯效，已在 OpenAI 对话里验证
         },
         # 输入模式：
         #   - "local_asr": 使用本地 VAD + SherpaASR
@@ -412,29 +407,16 @@ APP_CONFIG = {
         "rule_prompt": "注意：将结果处理成纯文字版，不要返回任何 markdown 格式，也不要包含任何代码块，并将字数控制在300字以内",
         "rule_prompt_for_skill": "注意：这条消息是主人通过小爱音箱发送给 QwenPaw 的，他看不到你回复的文字。字数控制在300字以内",
     },
-    # 小爱管家（"你好缪斯"）Configuration，需设置 MUSE_ENABLE=1
-    # 说"你好缪斯 + 问题" → 播报 wait_text → POST 到 webhook；回复由小爱管家调用 /api/play/text 推送
+    # 小爱管家（"你好缪斯"）唤醒词，需设置 MUSE_ENABLE=1
+    # 命中后由 before_wakeup 路由到 OpenAI 兼容服务（Hermes）连续对话，对话参数见上面的 "openai"
     "muse": {
-        # webhook 地址与 token：优先读环境变量 MUSE_WEBHOOK_URL / MUSE_WEBHOOK_TOKEN，
-        # 不要把真实 token 写进仓库
-        "url": "",
-        "token": "",
-        # 鉴权头：默认 "Authorization: Bearer <token>"；auth_scheme 设为 "" 则直接发送 token
-        "auth_header": "Authorization",
-        "auth_scheme": "Bearer",
-        "timeout": 10,  # 单次请求超时（秒）
-        "retries": 2,  # 仅网络错误 / 超时 / 5xx / 429 时重试
-        "retry_backoff": 0.5,  # 重试退避基数（秒），按 0.5s、1s… 递增
-        "source": "xiaoai-oh2p",  # payload.source
-        "speaker": "desk",  # payload.speaker
-        # 规范唤醒词：始终参与匹配；payload.wake_word 在无法确定命中写法时用它
+        # 规范唤醒词：始终参与匹配
         "wake_word": "你好缪斯",
         # ASR 文本前缀匹配的完整唤醒词集合（环境变量 MUSE_WAKE_WORDS 优先，用 , ， 、 分隔）
         # 匹配规则：
         #   - 忽略大小写、全半角、空格和中英文标点："hi muse" 也匹配 "Hi Muse" / "himuse" / "Hi，Muse"
         #   - 只在句首匹配；句首的标点和 leading_fillers 里的语气词可以跳过
         #   - 最长优先（"你好缪斯" 先于 "缪斯"）；英文唤醒词要求词边界（"museum" 不算 "muse"）
-        #   - 去掉唤醒词及其后的标点后转发，payload.wake_word 为命中的那一项（这里的写法）
         # 单独的"缪斯" / "muse"只在句首生效；妙思 / 木斯 / 慕斯 本身是常见词，只接受带问候语的写法
         "wake_words": [
             # 正写 + 英文
@@ -466,21 +448,8 @@ APP_CONFIG = {
         "match_mode": "prefix",
         # 小爱原生识别出缪斯文本时如何拦截原生回复：
         #   "abort"  — speaker.abort_xiaoai()（重启小爱服务，约 1-2 秒）
-        #   "dialog" — 复用 bridge 的 dialog 拦截（不重启，但原生回复晚到时可能打断"稍等"）
+        #   "dialog" — 复用 bridge 的 dialog 拦截（不重启，但原生回复晚到时可能打断开场提示）
         #   "none"   — 不拦截
         "native_suppress": "abort",
-        # 只说了"你好缪斯"时追问一句：
-        #   "local_asr" — 本地 VAD + ASR；"xiaoai_asr" — 接管小爱原生 ASR
-        "input_mode": "local_asr",
-        "followup_timeout": 8,  # 追问等待时长（秒）
-        "followup_prompt": "我在，请讲",  # 唤醒后的听取提示，设为 "" 只播放提示音
-        "listening_light": {
-            "enabled": True,  # 本地追问期间亮灯，录音结束、超时或中断后熄灯
-            "effect_id": 9,  # OH2P 固件 noangle 监听灯效；只定向关闭该编号
-        },
-        "wait_text": "稍等",  # 转发前的即时反馈，设为 "" 可关闭
-        "failure_text": "小爱管家暂时连不上",  # 重试后仍失败时播报，设为 "" 可关闭
-        "not_configured_text": "",  # 未配置 webhook 地址时播报（默认关闭）
-        "no_input_text": "",  # 追问超时未听到内容时播报（默认安静退出）
     },
 }

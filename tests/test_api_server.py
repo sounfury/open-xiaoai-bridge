@@ -1,6 +1,6 @@
-"""HTTP API 回归测试（PRD 7.2：小爱管家经 AgentDock 调 /api/play/text），无需音箱。
+"""HTTP API 回归测试（/api/play/text 主动播报、鉴权），无需音箱。
 
-    python -m pytest tests/test_muse_api_server.py
+    python -m pytest tests/test_api_server.py
 """
 
 import asyncio

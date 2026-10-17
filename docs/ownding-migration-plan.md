@@ -210,3 +210,6 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
 1. 音箱：`cd /data/open-xiaoai && cp client.upstream client`，然后重启客户端（或重启音箱）。新客户端另存为 `client.ownding`。
 2. 本机：停掉计划任务 `\OpenXiaoAI-Bridge` 及其 python 进程，把 `D:\ai\_ref\rollback\` 里的 `open_xiaoai_server` 和 `open_xiaoai_bridge-1.0.0.dist-info` 拷回 `.venv\Lib\site-packages\`，再启动计划任务。
 3. 两边必须一起回退：新旧客户端的音频帧格式不兼容。
+
+- 2026-10-18：清理小爱管家 webhook（Grok Bot）链路："你好缪斯"固定路由到 `"openai"`（Hermes），删除 webhook 客户端 / 单次处理器 / 追问模块和 mock 脚本。
+  已知问题：进入连续对话后会重新听一句，"你好缪斯，开灯"里的"开灯"不会带过去，留到阶段 3 + 4 一起处理。

@@ -27,7 +27,6 @@ except ImportError:
 
 import core.external_conversation as ext  # noqa: E402
 from core import ref  # noqa: E402
-from core.muse_followup import MuseFollowupCapture  # noqa: E402
 from core.services.listening_light import ListeningLightController  # noqa: E402
 
 SHOW = "ubus -t 1 call led show '{\"L\":9}'"
@@ -66,8 +65,6 @@ def env(monkeypatch):
     config = FakeConfig({
         "openclaw.listening_light": {"enabled": True, "effect_id": 9},
         "openclaw.input_mode": "local_asr",
-        "muse.listening_light": {"enabled": True, "effect_id": 9},
-        "muse.input_mode": "local_asr",
         "wakeup.timeout": 1,
     })
     monkeypatch.setattr(ext, "ConfigManager", SimpleNamespace(instance=lambda: config))
@@ -242,31 +239,3 @@ def test_interrupted_loop_skips_goodbye(env):
         conv._stop_xiaoai_native_listening.assert_not_awaited()
 
     asyncio.run(main())
-
-
-# ---- Muse 追问 ----
-
-def test_muse_stop_extinguishes_light_before_capture_returns(env):
-    async def main():
-        gate = asyncio.Event()
-        muse = MuseFollowupCapture(timeout=1)
-
-        async def fake_wait_for_speech(_vad):
-            await gate.wait()
-            return None
-
-        muse._wait_for_speech = fake_wait_for_speech
-        task = asyncio.create_task(muse.capture_once())
-        await drain()
-        assert commands(env.speaker) == [SHOW]
-
-        muse.stop()
-        await drain()
-        assert not task.done()
-        assert commands(env.speaker) == [SHOW, SHUT]
-
-        gate.set()
-        assert await task is None
-
-    asyncio.run(main())
-    assert commands(env.speaker) == [SHOW, SHUT]

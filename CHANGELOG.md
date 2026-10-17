@@ -6,20 +6,22 @@ All notable changes to this project will be documented in this file.
 
 ### 重点更新
 
-- 新增小爱管家"你好缪斯"单次路由（M1，`MUSE_ENABLE=1` 启用）：KWS 命中唤醒词或小爱 ASR 文本以唤醒词开头时，`before_wakeup` 返回 `"muse"`，先播报"稍等"，再把去掉唤醒词的文本 POST 到 webhook（`MUSE_WEBHOOK_URL` / `MUSE_WEBHOOK_TOKEN`，带超时与 5xx/429/网络错误重试）；只说唤醒词时复用 `local_asr` / `xiaoai_asr` 输入链路追问一句。"小爱同学"原生链路不变。
+- 新增小爱管家"你好缪斯"唤醒词（`MUSE_ENABLE=1` 启用）：KWS 命中唤醒词或小爱 ASR 文本以唤醒词开头时，`before_wakeup` 返回 `"openai"`，进入 OpenAI 兼容服务（Hermes）连续对话。"小爱同学"原生链路不变。
+  - 早期版本把请求单次 POST 到小爱管家 webhook，并在只说唤醒词时追问一句；已移除（`MuseWebhookClient` / `MuseRequestHandler` / `core/muse_followup.py`、`MUSE_WEBHOOK_URL` / `MUSE_WEBHOOK_TOKEN`、`muse.url` 等配置）。
 - 小爱管家唤醒词改为集合（容忍口误和 ASR 误识别）：默认包含 `你好缪斯` / `嗨缪斯` / `哈喽缪斯` / `hi缪斯` / `hi muse` / `hey muse` / 单独的 `缪斯` / `muse`，以及同音字（缪思、缪丝、谬斯、谬思）和近音字（妙思、妙斯、木斯、慕斯，仅限带问候语），共 52 个写法。可用 `MUSE_WAKE_WORDS`（`,` `，` `、` 分隔）或 `muse.wake_words` 覆盖。
   - 匹配规则：NFKC（全角 → 半角）+ 忽略大小写、空格和中英文标点；默认只在句首匹配（可跳过句首语气词 `muse.leading_fillers`）；最长优先；英文唤醒词要求词边界（`museum` 不触发 `muse`）。`match_mode = "contains"` 仅作为显式开启的选项保留。
-  - 转发前去掉唤醒词及其后标点；`payload.wake_word` 改为本次命中的那一项（配置里的写法），没有命中时回退到 `muse.wake_word`。
+  - 解析结果给出命中的那一项（配置里的写法）和去掉唤醒词及其后标点的剩余文本。
   - 本地 KWS 只并入"问候语 + 名字"子集（`muse.kws_wake_words` / `MUSE_KWS_WAKE_WORDS`，默认 `你好缪斯` `嗨缪斯` `哈喽缪斯` `hi muse` `hey muse` `hello muse`），`MUSE_ENABLE=1` 时生成 `keywords.txt` 自动合并、去重；单独的 2 音节名字和同音/近音字只走 ASR 前缀，降低常驻监听误唤醒。
   - 小爱原生 ASR 文本等于缪斯 KWS 唤醒词（忽略大小写和标点，如 `Hey Muse.`）时，同样按外部唤醒词接管。
 - 关键词生成（`core/services/audio/kws/keywords.py`）改为逐条编码：含模型词表外字符的关键词跳过并告警（`sherpa_onnx.text2token` 原本会静默丢弃），全部失败时返回非零；关键词先做 NFKC 再转大写。
 - HTTP API 新增可选 Bearer 鉴权：设置 `API_SERVER_TOKEN` 后 `/api/*`（`/api/health` 除外）需携带 `Authorization: Bearer <token>`；未设置时行为不变。`skills/xiaoai-tts` 支持 `OPENXIAOAI_API_TOKEN`。
 - `/api/play/text` 支持可选 `request_id` 字段（写入日志并原样返回）。
+- 外部对话后端按监听 / 思考 / 回答切换 OH2P 灯效（`listening_light`）。
+- `native/` 改用 OwnDing/open-xiaoai 的 crate（需要配套的 OwnDing 音箱客户端 `client-2026.10.09`+，旧客户端不兼容）：二进制音频帧、新连接接管旧连接、快速重连不重复播"已连接"；可选请求播放回采（`barge_in.echo_reference`，默认关闭），为播报中打断做准备。见 `docs/ownding-migration-plan.md`。
 
 ### 开发与测试
 
-- 新增 `tests/test_muse.py`、`tests/test_muse_api_server.py`、`tests/test_muse_wake_words.py`，无需音箱、原生扩展与模型。
-- 新增 `scripts/mock_muse_webhook.py`（本地 mock webhook）和 `scripts/simulate_muse.py`（无音箱模拟一次缪斯请求）。
+- 新增 `tests/test_muse.py`、`tests/test_muse_wake_words.py`、`tests/test_api_server.py`、`tests/test_listening_light.py`、`tests/test_echo_ref_input.py`，无需音箱、原生扩展与模型。
 
 ## v1.0.7 - 2026-07-14
 

@@ -21,8 +21,7 @@ open-xiaoai-bridge/
 │   ├── openclaw.py                # OpenClaw 网关客户端（连接、消息、TTS 播放）
 │   ├── openclaw_conversation.py   # OpenClaw 连续对话循环（VAD → ASR → Agent → TTS）
 │   ├── wakeup_session.py          # 小智唤醒会话状态机
-│   ├── muse.py                    # 小爱管家（你好缪斯）路由：文本解析、webhook 客户端、单次处理器
-│   ├── muse_followup.py           # 小爱管家追问一句（复用外部后端输入链路）
+│   ├── muse.py                    # 小爱管家（你好缪斯）唤醒词：集合、文本解析、KWS 子集、拦截原生小爱
 │   ├── ref.py                     # 全局引用注册表（get/set 依赖注入）
 │   ├── models/                    # 模型文件（KWS/VAD/ASR，.gitignore 排除）
 │   ├── assets/sounds/             # 音效（tts_notify.mp3 等）
@@ -176,12 +175,12 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 **路由规则**（`before_wakeup` 返回值）:
 - `"xiaozhi"` → 走小智流程
 - `"openclaw"` → 走 OpenClaw 连续对话
-- `"muse"` → 小爱管家单次请求（`core/muse.py`：可选追问一句 → 播报"稍等" → POST webhook），需 `MUSE_ENABLE=1`
+- `"openai"` → 走 OpenAI 兼容服务（Hermes）连续对话；"你好缪斯"唤醒词（`MUSE_ENABLE=1`）也路由到这里
+- `"qwenpaw"` → 走 QwenPaw 连续对话
 - `None` → 不处理（用户自行处理）
 
 **小爱管家（muse）边界约束**:
-- 只做单次转发，不等待回复；回复由 agent 调 `/api/play/text` 推送
-- 追问复用 `ExternalConversationController` 的输入链路（`core/muse_followup.py`），`on_interrupt()` 只停止追问，不取消已发出的 webhook 请求
+- `core/muse.py` 只负责唤醒词（匹配、KWS 子集、拦截原生小爱），不再有自己的请求链路；对话由 `"openai"` 路由负责
 - `core/muse.py` 顶层不能导入 `open_xiaoai_server`（config.py / 测试会直接导入）
 
 **边界约束**:
@@ -332,8 +331,8 @@ python3 tests/test_tts_latency.py --formats mp3,pcm --rounds 3 --repeat 8
 # OpenClaw 连通性测试
 python3 tests/test_openclaw_live_connectivity.py
 
-# 小爱管家路由 / API 鉴权（无音箱、无原生扩展）
-python3 -m pytest tests/test_muse*.py
+# 小爱管家唤醒词 / API 鉴权（无音箱、无原生扩展）
+python3 -m pytest tests/test_muse*.py tests/test_api_server.py
 ```
 
 注意：`DoubaoTTS` 在类定义时调用 `ConfigManager.instance()`，真实实例会把 `DEVICE_ID` 写回当前目录的 `config.py`；新测试导入相关模块时应先 stub `ConfigManager.instance`。

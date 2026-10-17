@@ -264,11 +264,6 @@ class MainApp:
                     )
                     == "local_asr"
                 )
-                or (
-                    enable_muse
-                    and self.config.get_app_config("muse.input_mode", "local_asr")
-                    == "local_asr"
-                )
             ):
                 from core.services.audio.asr import ASRService
 

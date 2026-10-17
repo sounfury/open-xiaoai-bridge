@@ -110,9 +110,7 @@ OPEN_XIAOAI_TOKEN=your-secret-token API_SERVER_ENABLE=1 ./scripts/start.sh
 | `OPENCLAW_ENABLE`    | 启用 OpenClaw | 禁用            |
 | `OPENAI_ENABLE` | 启用 OpenAI 兼容服务 | 禁用        |
 | `QWENPAW_ENABLE` | 启用 QwenPaw | 禁用        |
-| `MUSE_ENABLE`        | 启用小爱管家（"你好缪斯"）路由，见[小爱管家](#-小爱管家你好缪斯) | 禁用 |
-| `MUSE_WEBHOOK_URL`   | 小爱管家 webhook 地址（优先于 config `muse.url`） | 空（不转发） |
-| `MUSE_WEBHOOK_TOKEN` | 小爱管家 webhook token（优先于 config `muse.token`） | 空（不带鉴权头） |
+| `MUSE_ENABLE`        | 启用小爱管家（"你好缪斯"）唤醒词，见[小爱管家](#-小爱管家你好缪斯) | 禁用 |
 | `MUSE_WAKE_WORDS`    | 小爱管家 ASR 唤醒词集合，用 `,` `，` `、` 分隔（替换 config `muse.wake_words`） | 见[唤醒词](#唤醒词) |
 | `MUSE_KWS_WAKE_WORDS` | 并入本地 KWS 的小爱管家唤醒词（替换 config `muse.kws_wake_words`） | 见[唤醒词](#唤醒词) |
 | `API_SERVER_ENABLE`  | 启用 HTTP API | 禁用            |
@@ -353,7 +351,7 @@ curl -X POST http://localhost:9092/api/interrupt
 curl -X POST http://127.0.0.1:9092/api/play/text \
   -H "Authorization: Bearer $API_SERVER_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"text": "好的，已安排", "request_id": "<webhook 里的 request_id>"}'
+  -d '{"text": "好的，已安排", "request_id": "reminder-001"}'
 ```
 
 ***
@@ -888,22 +886,22 @@ APP_CONFIG = {
 
 ## 🎼 小爱管家（你好缪斯）
 
-本 fork 新增的单次请求路由：说 **"你好缪斯 + 问题"**，bridge 先播报"稍等"，再把识别文本 POST 到小爱管家（Grok Bot agent）的 webhook；
-小爱管家处理完后经 AgentDock 在本机调用 `POST http://127.0.0.1:9092/api/play/text` 推送回复。**"小爱同学"原生链路不受影响**。
+本 fork 新增的唤醒词：说 **"你好缪斯"**，进入 OpenAI 兼容服务（本机部署为 Hermes Agent，模型 `muse-home`）的连续对话，
+和"召唤小黑"走的是同一条 `"openai"` 链路。**"小爱同学"原生链路不受影响**。
 
-设置 `MUSE_ENABLE=1` 启用（会同时启用 KWS 关键词生成和 VAD/KWS，与其他后端相同）。
+需要同时设置 `MUSE_ENABLE=1`（启用缪斯唤醒词，会同时启用 KWS 关键词生成和 VAD/KWS）和 `OPENAI_ENABLE=1`（启用对话后端，见 [OpenAI 兼容服务](#-openai-兼容服务)）。
+Hermes 需要主动播报时调用本机 `POST /api/play/text`。
 
 ### 触发方式
 
 | 说法 | 来源 | 行为 |
 | --- | --- | --- |
-| "你好缪斯" / "嗨缪斯" / "hey muse"（本地 KWS 命中） | `kws` | 播放提示音后追问一句（`muse.input_mode`），再转发 |
-| "小爱同学" → "你好缪斯，我今晚想洗澡" / "Muse，我今晚想洗澡" | `xiaoai` | 去掉唤醒词和标点，拦截原生小爱回复（`muse.native_suppress`），直接转发"我今晚想洗澡" |
-| "小爱同学" → "你好缪斯" / "Hey Muse" | `xiaoai` | 等于某个 KWS 唤醒词：按外部唤醒词处理（拦截原生对话），追问一句再转发 |
-| "小爱同学" → "缪斯" | `xiaoai` | 只说了唤醒词：拦截原生回复，追问一句再转发 |
-| "小爱同学，开灯" / "我喜欢缪斯" / "museum 门票多少钱" | `xiaoai` | 原生小爱处理，不经过 bridge 转发 |
+| "你好缪斯" / "嗨缪斯" / "hey muse"（本地 KWS 命中） | `kws` | 进入 OpenAI 兼容服务连续对话 |
+| "小爱同学" → "你好缪斯" / "Hey Muse" | `xiaoai` | 等于某个 KWS 唤醒词：按外部唤醒词处理（拦截原生对话），进入连续对话 |
+| "小爱同学" → "你好缪斯，我今晚想洗澡" / "缪斯" | `xiaoai` | 拦截原生小爱回复（`muse.native_suppress`），进入连续对话 |
+| "小爱同学，开灯" / "我喜欢缪斯" / "museum 门票多少钱" | `xiaoai` | 原生小爱处理 |
 
-追问超时（`muse.followup_timeout`，默认 8 秒）未听到内容则安静退出。
+> 目前进入连续对话后会重新听一句，唤醒词后面同一句里的内容（上例的"我今晚想洗澡"）不会带过去。
 
 ### 唤醒词
 
@@ -928,8 +926,7 @@ APP_CONFIG = {
 3. **最长优先**：`你好缪斯` 先于 `缪斯`，`hey muse` 先于 `muse`。
 4. **英文词边界**：以英文字母结尾的唤醒词，后面紧跟的字符不能是英文字母或数字。`museum`、`musea`、`mused`、`hi museum` 不触发；`muse, 开灯`、`muse开灯`、`Muse 我今晚想洗澡` 触发。
 5. **中文不设词边界**：ASR 经常不打标点，`缪斯开灯` 必须能匹配；代价是 `缪斯特罗姆` 这类以"缪斯"开头的罕见说法也会触发。所以容易和常见词混淆的近音字只收带问候语的写法。
-6. **去掉唤醒词**：转发的 `text` 是原文去掉唤醒词及其后标点的部分（`"Hey Muse！！ 开灯"` → `"开灯"`）；剩下的只有语气词或标点时，视为只说了唤醒词，走追问。
-7. **`payload.wake_word`** 是命中的那一项在配置里的写法：说"嗨，缪思"得到 `"嗨缪思"`，KWS 返回 `hi▁muse` 得到 `"hi muse"`。文本里没有唤醒词时（例如追问内容）用 `muse.wake_word`（`你好缪斯`）。
+6. **解析结果**：`MuseMatch.wake_word` 是命中的那一项在配置里的写法（说"嗨，缪思"得到 `"嗨缪思"`，KWS 返回 `hi▁muse` 得到 `"hi muse"`）；`MuseMatch.content` 是去掉唤醒词及其后标点的部分（`"Hey Muse！！ 开灯"` → `"开灯"`），只剩语气词或标点时为空。
 
 **为什么 KWS 只放 6 个**：KWS 模型（`tokens.txt` + `bpe.model`，`cjkchar+bpe`）对上面所有候选都能编码——汉字全在词表里，英文走 BPE（`hi muse` → `▁HI ▁MU S E`，`hey muse` → `▁HE Y ▁MU S E`）。但 KWS 是常驻监听的：
 
@@ -944,7 +941,7 @@ MUSE_WAKE_WORDS="你好缪斯，缪斯，hey muse、muse" \
 MUSE_KWS_WAKE_WORDS="你好缪斯,hey muse" ./scripts/start.sh
 ```
 
-路由在 `config.py` 的 `before_wakeup` 里，返回 `"muse"` 后由 `EventManager` 调用 `core/muse.py` 的 `MuseRequestHandler`：
+路由在 `config.py` 的 `before_wakeup` 里：
 
 ```python
 from core.muse import match_muse_text, suppress_native_xiaoai
@@ -952,7 +949,7 @@ from core.muse import match_muse_text, suppress_native_xiaoai
 if match_muse_text(text):          # MUSE_ENABLE 未开启时恒为 None
     if source == "xiaoai":
         await suppress_native_xiaoai(speaker)
-    return "muse"
+    return "openai"
 ```
 
 > 使用自定义 `config.py`（Docker 挂载 / `CONFIG_PATH`）时，需要把上面这段 `before_wakeup` 代码和 `APP_CONFIG["muse"]` 一起合并进去，否则不会触发。
@@ -962,69 +959,22 @@ if match_muse_text(text):          # MUSE_ENABLE 未开启时恒为 None
 
 | 项 | 环境变量 / `APP_CONFIG["muse"]` | 默认值 |
 | --- | --- | --- |
-| webhook 地址 | `MUSE_WEBHOOK_URL` / `url` | 空：只打印警告，不转发、不播"稍等" |
-| webhook token | `MUSE_WEBHOOK_TOKEN` / `token` | 空：不发送鉴权头 |
-| 鉴权头 | `auth_header` + `auth_scheme` | `Authorization: Bearer <token>`；`auth_scheme: ""` 时直接发送 token |
-| 超时 / 重试 | `timeout` / `retries` / `retry_backoff` | 10 秒 / 2 次 / 0.5 秒起指数退避；仅网络错误、超时、5xx、429 重试，其他 4xx 不重试 |
-| payload 标识 | `source` / `speaker` / `wake_word` | `xiaoai-oh2p` / `desk` / `你好缪斯`（`wake_word` 只是回退值，实际发送命中的唤醒词） |
-| 唤醒词 | `MUSE_WAKE_WORDS` / `wake_words`、`MUSE_KWS_WAKE_WORDS` / `kws_wake_words`、`wake_word_aliases`、`leading_fillers`、`match_mode` | 见[唤醒词](#唤醒词)；`match_mode` 默认 `prefix` |
-| 提示语 | `wait_text` / `failure_text` / `not_configured_text` / `no_input_text` | `稍等` / `小爱管家暂时连不上` / 空 / 空（空字符串表示不播报） |
+| 唤醒词 | `MUSE_WAKE_WORDS` / `wake_words`、`MUSE_KWS_WAKE_WORDS` / `kws_wake_words`、`wake_word`、`wake_word_aliases`、`leading_fillers`、`match_mode` | 见[唤醒词](#唤醒词)；`match_mode` 默认 `prefix` |
 | 原生拦截 | `native_suppress` | `abort`（同 `召唤龙虾` 示例，重启小爱约 1-2 秒）；可选 `dialog`、`none` |
-| 追问输入 | `input_mode` / `followup_timeout` | `local_asr` / 8 秒 |
 
-token 只从环境变量或本地配置读取，日志不会输出 token，webhook 地址在日志里只显示 `scheme://host:port`。
-
-### Webhook payload
-
-```http
-POST <MUSE_WEBHOOK_URL>
-Content-Type: application/json; charset=utf-8
-Authorization: Bearer <MUSE_WEBHOOK_TOKEN>
-```
-
-```json
-{
-  "request_id": "0fd9f0e4-de73-4539-ab9f-dd257b29bed5",
-  "source": "xiaoai-oh2p",
-  "speaker": "desk",
-  "wake_word": "你好缪斯",
-  "text": "我今晚想洗澡",
-  "app": "xiaoai",
-  "ts": "2026-10-16T21:30:00+08:00",
-  "reply": {"mode": "push"}
-}
-```
-
-- `wake_word`：命中的唤醒词（配置里的写法，如 `"hey muse"`、`"你好缪思"`）；`text` 已去掉唤醒词。
-- `app`：唤醒来源（`"kws"` / `"xiaoai"`），不会序列化 `MainApp` 对象。
-- `ts`：本机时区的 ISO 8601 时间。
-- 重试时复用同一个 `request_id`，接收端可据此去重；收到 2xx 即视为已投递，bridge 不等待回复。
-- 回复时可把 `request_id` 带进 `/api/play/text`，便于对照日志。
+对话本身（地址、模型、输入模式、提示语、灯效）都在 `APP_CONFIG["openai"]` 里配置。
 
 ### 无音箱测试
 
 ```bash
-# 单元测试（stub 掉原生扩展，用本地 aiohttp mock webhook）
 python -m pytest tests/test_muse*.py
 python -m unittest discover -s tests -p "test_muse*.py"
-
-# 终端 1：本地 mock webhook，打印收到的 payload
-python scripts/mock_muse_webhook.py                    # http://127.0.0.1:18080/webhook
-#   --require-token 校验 MUSE_WEBHOOK_TOKEN；--fail-first 2 测重试；--delay 15 测超时
-#   --reply-to http://127.0.0.1:9092/api/play/text 模拟小爱管家回推播报
-
-# 终端 2：走 config.before_wakeup + MuseRequestHandler，音箱动作只打印
-python scripts/simulate_muse.py "你好缪斯，我今晚想洗澡" --url http://127.0.0.1:18080/webhook
-python scripts/simulate_muse.py 你好缪斯 --source kws --followup "把台灯调暗一点" \
-    --url http://127.0.0.1:18080/webhook
 ```
 
 接上音箱后：
 
 ```bash
-MUSE_ENABLE=1 API_SERVER_ENABLE=1 \
-MUSE_WEBHOOK_URL=<小爱管家 webhook> MUSE_WEBHOOK_TOKEN=<token> \
-API_SERVER_TOKEN=<本机 API token，可选> ./scripts/start.sh
+MUSE_ENABLE=1 OPENAI_ENABLE=1 API_SERVER_ENABLE=1 OPENAI_BASE_URL=<Hermes 地址>/v1 OPENAI_MODEL=muse-home OPENAI_API_KEY=<key> API_SERVER_TOKEN=<本机 API token，可选> ./scripts/start.sh
 ```
 
 ***

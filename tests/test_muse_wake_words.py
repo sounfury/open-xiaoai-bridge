@@ -25,7 +25,7 @@ sys.modules.setdefault("open_xiaoai_server", types.SimpleNamespace())
 
 muse = importlib.import_module("core.muse")
 
-MUSE_ENV_KEYS = ("MUSE_ENABLE", "MUSE_WEBHOOK_URL", "MUSE_WEBHOOK_TOKEN", "MUSE_WAKE_WORDS", "MUSE_KWS_WAKE_WORDS")
+MUSE_ENV_KEYS = ("MUSE_ENABLE", "MUSE_WAKE_WORDS", "MUSE_KWS_WAKE_WORDS")
 
 
 def env(**values):
@@ -468,7 +468,7 @@ class KeywordGenerationTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 路由：before_wakeup / 原生 ASR 外部唤醒 / handler
+# 路由：before_wakeup / 原生 ASR 外部唤醒
 # ---------------------------------------------------------------------------
 
 
@@ -499,14 +499,14 @@ class BeforeWakeupWakeWordRoutingTest(unittest.IsolatedAsyncioTestCase):
         result = await self.config.before_wakeup(speaker, text, source, mock.AsyncMock())
         return result, speaker.events
 
-    async def test_variants_route_to_muse(self):
+    async def test_variants_route_to_openai(self):
         with env(MUSE_ENABLE="1"):
             for text in ("Hey Muse，开灯", "嗨，缪思，几点了", "muse 我今晚想洗澡", "嗯，缪斯"):
                 with self.subTest(text=text):
-                    self.assertEqual(await self.route(text, "xiaoai"), ("muse", [("abort",)]))
+                    self.assertEqual(await self.route(text, "xiaoai"), ("openai", [("abort",)]))
             for text in ("hi▁muse", "hey▁muse", "嗨缪斯", "哈喽缪斯"):
                 with self.subTest(text=text):
-                    self.assertEqual(await self.route(text, "kws"), ("muse", []))
+                    self.assertEqual(await self.route(text, "kws"), ("openai", []))
 
     async def test_non_muse_text_falls_through(self):
         with env(MUSE_ENABLE="1"):
@@ -610,50 +610,6 @@ class XiaoAINativeMuseKeywordTest(unittest.TestCase):
             self.xiaoai.refresh_runtime_config()
             self.assertEqual(self.dispatch("Hey Muse"), [("Hey Muse", "xiaoai")])
             self.assertEqual(self.dispatch("你好小黑"), [("suppress", "d1"), ("你好小黑", "kws")])
-
-
-class MuseHandlerWakeWordTest(unittest.IsolatedAsyncioTestCase):
-    def make_handler(self):
-        self.sent = []
-        settings = default_settings()
-        settings.url = "http://127.0.0.1:1/hook"
-        settings.wait_text = ""
-        handler = muse.MuseRequestHandler(settings=settings, speaker=FakeSpeaker())
-
-        async def send(text, app_context=None, request_id=None, wake_word=None):
-            self.sent.append(handler.client.build_payload(text, app_context=app_context, wake_word=wake_word))
-            return muse.MuseDeliveryResult(request_id="rid", delivered=True)
-
-        handler.client.send = send
-        return handler
-
-    async def test_payload_wake_word_is_matched_entry(self):
-        handler = self.make_handler()
-        await handler.handle("嗨，缪思，开灯", "xiaoai")
-        await handler.handle("Hey Muse 我今晚想洗澡", "xiaoai")
-        await handler.handle("把台灯调暗一点", "xiaoai")  # 不含唤醒词：用规范唤醒词
-        self.assertEqual(
-            [(p["wake_word"], p["text"]) for p in self.sent],
-            [("嗨缪思", "开灯"), ("hey muse", "我今晚想洗澡"), ("你好缪斯", "把台灯调暗一点")],
-        )
-
-    async def test_bare_variant_uses_followup_path(self):
-        handler = self.make_handler()
-        followup = mock.AsyncMock(return_value="把台灯调暗一点")
-        with mock.patch.object(handler, "capture_followup", followup):
-            await handler.handle("hi▁muse", "kws")
-            await handler.handle("Muse。", "xiaoai")
-        self.assertEqual(followup.await_count, 2)
-        self.assertEqual(
-            [(p["wake_word"], p["text"], p["app"]) for p in self.sent],
-            [("hi muse", "把台灯调暗一点", "kws"), ("muse", "把台灯调暗一点", "xiaoai")],
-        )
-
-    async def test_followup_wake_word_used_when_first_text_had_none(self):
-        handler = self.make_handler()
-        with mock.patch.object(handler, "capture_followup", mock.AsyncMock(return_value="缪斯，开灯")):
-            await handler.handle("", "kws")
-        self.assertEqual([(p["wake_word"], p["text"]) for p in self.sent], [("缪斯", "开灯")])
 
 
 if __name__ == "__main__":

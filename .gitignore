@@ -49,10 +49,6 @@ config-local.py
 
 **/models
 
-# local muse webhook secret
-.muse_webhook_token
-_m1_preserve/
-_m1_*.ps1
 logs/
 
 .hermes_api_key
