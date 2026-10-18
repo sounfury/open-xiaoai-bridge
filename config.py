@@ -53,93 +53,8 @@ async def before_wakeup(speaker, text, source, app):
             await suppress_native_xiaoai(speaker)  # 拦截原生小爱对这句话的处理
         return "openai"
 
-    if source == "kws":
-        # --- 示例一：按唤醒词路由到不同 Agent ---
-        # AGENT_SESSIONS = {
-        #     "龙虾": "agent:assistant:open-xiaoai-bridge",  # 说"你好龙虾" → 路由到 assistant Agent
-        #     "小美": "agent:xiaomei:open-xiaoai-bridge",    # 说"你好小美" → 路由到 xiaomei Agent
-        #     "管家": "agent:butler:open-xiaoai-bridge",     # 说"你好管家" → 路由到 butler Agent
-        # }
-        # for keyword, session_key in AGENT_SESSIONS.items():
-        #     if keyword in text:
-        #         app.set_openclaw_session_key(session_key)
-        #         await speaker.play(text=f"{keyword}来了")
-        #         return "openclaw"
-
-        # --- 示例二：每次唤醒生成独立 Session ---
-        # if "龙虾" in text:
-        #     app.set_openclaw_session_key(new_session_key())
-        #     await speaker.play(text="龙虾来了")
-        #     return "openclaw"
-
-        # --- 示例三：进入 OpenClaw 前播放服务端本地开场白 ---
-        # if "龙虾" in text:
-        #     await speaker.play(server_file="/path/to/openclaw_intro.wav")
-        #     return "openclaw"
-
-        # Route to OpenClaw Agent by wake word
-        if "龙虾" in text:
-            await speaker.play(text="龙虾来了")
-            return "openclaw"
-
-        if "小黑" in text:
-            await speaker.play(text="小黑来了")
-            return "openai"
-
-        if "小爪" in text:
-            await speaker.play(text="小爪来了")
-            return "qwenpaw"
-
-        if "小智" in text:
-            await speaker.play(text="小智来了")
-            return "xiaozhi"
-
-        return None
-
-    if source == "xiaoai":
-        # --- 示例四：小爱指令按用户名路由到不同 Session ---
-        # if text == "召唤小美":
-        #     app.set_openclaw_session_key("agent:xiaomei:open-xiaoai-bridge")
-        #     await speaker.abort_xiaoai()
-        #     return "openclaw"
-
-        if text == "召唤龙虾":
-            await speaker.abort_xiaoai()
-            return "openclaw"  # OpenClaw continuous conversation
-
-        if text == "召唤小黑":
-            await speaker.abort_xiaoai()
-            return "openai"  # OpenAI-compatible service continuous conversation
-
-        if text == "召唤小爪":
-            await speaker.abort_xiaoai()
-            return "qwenpaw"  # QwenPaw continuous conversation
-
-        if text == "召唤小智":
-            await speaker.abort_xiaoai()
-            return "xiaozhi"  # XiaoZhi AI
-
-        if "让龙虾" in text:
-            await speaker.abort_xiaoai()
-            # One-shot: send to OpenClaw and play the reply via TTS
-            await app.send_to_openclaw_and_play_reply(text.replace("让龙虾", ""))
-            return None  # No further handling by the framework
-
-        if "告诉龙虾" in text:
-            await speaker.abort_xiaoai()
-            # Fire-and-forget: let the Agent decide when/how to reply
-            await app.send_to_openclaw(text.replace("告诉龙虾", ""))
-            return None
-
-        if "让小黑" in text:
-            await speaker.abort_xiaoai()
-            await app.send_to_openai_and_play_reply(text.replace("让小黑", ""))
-            return None
-
-        if "让小爪" in text:
-            await speaker.abort_xiaoai()
-            await app.send_to_qwenpaw_and_play_reply(text.replace("让小爪", ""))
-            return None
+    # 其他唤醒词 / 小爱指令不处理（上游的龙虾、小黑、小爪、小智演示路由已删除）
+    return None
 
 
 async def after_wakeup(speaker, source=None, session_key=None):
@@ -154,44 +69,24 @@ async def after_wakeup(speaker, source=None, session_key=None):
     - session_key: 当前 OpenClaw/OpenAI/QwenPaw 后端 session_key
         可据此区分是哪个 Agent 退出，例如播放不同的退出提示语
     """
-    if source == "openclaw":
-        # 示例：退出 OpenClaw 时播放服务端本地结束语
-        # await speaker.play(server_file="/path/to/openclaw_bye.wav")
-
-        # 示例：按 agentId 区分退出提示语
-        # 所有后端的 session_key 已统一为 agent:<agentId>:<rest> 格式，第二段即 agentId。
-        # 仍建议做越界防护，以兼容自定义的非标准 session_key。
-        # parts = session_key.split(":") if session_key else []
-        # agent_id = parts[1] if len(parts) > 1 else None
-        # if agent_id == "assistant":
-        #     await speaker.play(text="助手，再见")
-        # elif agent_id == "xiaomei":
-        #     await speaker.play(text="小美，再见")
-        # else:
-        #     await speaker.play(text="再见")
-        await speaker.play(text="龙虾，再见")
     if source == "openai":
-        await speaker.play(text="小黑，再见")
-    if source == "qwenpaw":
-        await speaker.play(text="小爪，再见")
-    if source == "xiaozhi":
-        await speaker.play(text="小智，再见")
+        await speaker.play(text="再见")
+
 
 APP_CONFIG = {
     "wakeup": {
-        # 自定义唤醒词列表（英文字母要全小写）
-        # MUSE_ENABLE=1 时，生成 keywords.txt 会自动并入 muse.kws_wake_words（无需在这里重复）
+        # 本地 KWS 常驻监听的唤醒词（英文字母要全小写）。只留缪斯一组：每多一个词就多一条误唤醒路径。
+        # 和 muse.kws_wake_words 相同（MUSE_ENABLE=1 时两边合并去重）；放在这里是为了不开 MUSE_ENABLE 时 KWS 也能用。
+        # 单独的"缪斯"不放：验收时句子里提到"缪斯"（"她是我的缪斯"）几乎都会误唤醒，"妙思"也会。
+        # 调整后用 scripts/kws_acceptance.py 验收（用法见脚本开头的说明）。
         "keywords": [
-            "你好小智",
-            "小智小智",
-            "hi open claw",
-            "你好龙虾",
-            "龙虾你好",
-            "你好小黑",
-            "小黑你好",
-            "你好小爪",
-            "小爪你好",
             "你好缪斯",
+            "嗨缪斯",
+            "哈喽缪斯",
+            "嘿缪斯",
+            "hi muse",
+            "hey muse",
+            "hello muse",
         ],
         # 静音多久后自动退出唤醒（秒）
         "timeout": 20,
