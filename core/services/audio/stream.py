@@ -1,9 +1,10 @@
+import threading
 import uuid
 from typing import Any, Callable, ClassVar, Optional
 
 
 # 全局流保留最近这么多秒的输入，用于打断后把唤醒词之后已经说出的话补给 VAD
-HISTORY_SECONDS = 3
+HISTORY_SECONDS = 6
 _BYTES_PER_SAMPLE = 2  # 16 kHz 单声道 int16
 
 
@@ -15,28 +16,48 @@ class __GlobalStream:
         self.samples = 0
         self._history = bytearray()
         self._history_limit = HISTORY_SECONDS * 16000 * _BYTES_PER_SAMPLE
+        # input() 在原生回调线程里跑；回放（since + 注册）要和它互斥，否则会漏掉或重复一包
+        self._lock = threading.Lock()
 
-    def register_reader(self, reader):
-        if reader.id not in self.readers:
-            self.readers[reader.id] = reader
+    def register_reader(self, reader, since: int | None = None):
+        """注册读者；带 since（绝对采样位置）时，先把从那里到现在的历史放进读者的缓冲区。"""
+        with self._lock:
+            if since is not None:
+                history = self._since_locked(since)
+                if history:
+                    reader.input(history)
+            if reader.id not in self.readers:
+                self.readers[reader.id] = reader
 
     def unregister_reader(self, reader) -> None:
         if reader.id in self.readers:
             del self.readers[reader.id]
 
     def input(self, data: bytes) -> None:
-        self._history.extend(data)
-        overflow = len(self._history) - self._history_limit
-        if overflow > 0:
-            del self._history[:overflow]
-        self.samples += len(data) // _BYTES_PER_SAMPLE
-        for key in list(self.readers):
-            reader = self.readers.get(key)
-            if reader is not None:
+        with self._lock:
+            self._history.extend(data)
+            overflow = len(self._history) - self._history_limit
+            if overflow > 0:
+                del self._history[:overflow]
+            self.samples += len(data) // _BYTES_PER_SAMPLE
+            readers = list(self.readers.values())
+            for reader in readers:
                 reader.input(data)
 
     def since(self, sample: int) -> bytes:
         """从绝对位置 sample 到现在的输入；超出保留范围的部分丢弃。"""
+        with self._lock:
+            return self._since_locked(sample)
+
+    def between(self, start: int, end: int) -> bytes:
+        """绝对位置 [start, end) 之间的输入（只取还在保留范围内的部分）。"""
+        with self._lock:
+            data = self._since_locked(start)
+            begin = self.samples - len(data) // _BYTES_PER_SAMPLE  # data 实际起点
+            keep = max(0, int(end) - begin)
+            return data[: keep * _BYTES_PER_SAMPLE]
+
+    def _since_locked(self, sample: int) -> bytes:
         count = max(0, self.samples - max(0, int(sample)))
         size = min(count * _BYTES_PER_SAMPLE, len(self._history))
         return bytes(self._history[len(self._history) - size :]) if size else b""
@@ -85,6 +106,11 @@ class MyStream:
         """已收到但还没被 read() 取走的采样数。"""
         return max(0, len(self.input_bytes) - self._read_offset) // 2
 
+    def position(self) -> int:
+        """下一个要读的采样在 GlobalStream 里的绝对位置（只对已注册的输入流有意义）。"""
+        with GlobalStream._lock:
+            return GlobalStream.samples - self.unread_samples()
+
     def clear_input(self) -> None:
         """Drop all buffered input and reset the read cursor.
 
@@ -96,11 +122,12 @@ class MyStream:
         self.input_bytes.clear()
         self._read_offset = 0
 
-    def start_stream(self) -> None:
+    def start_stream(self, since: int | None = None) -> None:
+        """开始接收输入；since（绝对采样位置）表示先回放从那里到现在的历史。"""
         if not self._is_active:
             self._is_active = True
             if self._is_input:
-                GlobalStream.register_reader(self)
+                GlobalStream.register_reader(self, since)
 
     def stop_stream(self) -> None:
         if self._is_active:

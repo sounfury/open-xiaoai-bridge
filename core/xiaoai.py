@@ -54,10 +54,12 @@ class XiaoAI:
     # 双声道录音里麦克风声道的电平比单声道录音低，乘这个倍数回到原来的电平
     _echo_mic_gain = 64.0
     _echo_dump: dict | None = None
+    _input_dump: dict | None = None  # AUDIO_INPUT_DUMP：KWS / VAD 实际收到的单声道音频
     # 回声消除器（收到第一帧双声道录音时创建），见 core/services/audio/aec.py
     echo = None
     _echo_seen: float | None = None  # 最近一次收到双声道录音（monotonic）
     _echo_until = 0.0  # 这个时间之前的输入可能还带着（消除后的）播放残留
+    _echo_until_sample = 0  # 同上，按 GlobalStream 绝对采样位置（回放历史时用）
     # 录音看门狗
     _last_input_at: float | None = None
     _recording_wanted = True
@@ -197,6 +199,8 @@ class XiaoAI:
             hangover_s = float(barge_in.get("echo_vad_hangover_ms", 300)) / 1000
             delay_s = (len(frames) + cls.echo.delay) / 16000
             cls._echo_until = now + delay_s + hangover_s
+            # 这一包从 GlobalStream.samples 开始写入
+            cls._echo_until_sample = GlobalStream.samples + int((delay_s + hangover_s) * 16000)
         return np.clip(np.round(cleaned), -32768, 32767).astype(np.int16).tobytes()
 
     @classmethod
@@ -209,6 +213,11 @@ class XiaoAI:
     def echo_active(cls) -> bool:
         """当前输入可能还带着播放残留（正在播放或刚停）。"""
         return cls.echo_reference_live() and time.monotonic() < cls._echo_until
+
+    @classmethod
+    def echo_active_at(cls, sample: int) -> bool:
+        """GlobalStream 里绝对位置 sample 处的输入可能带着播放残留。"""
+        return cls.echo_reference_live() and sample < cls._echo_until_sample
 
     @classmethod
     def near_end_ratio_db(cls) -> float | None:

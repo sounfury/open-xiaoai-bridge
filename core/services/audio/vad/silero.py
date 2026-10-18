@@ -86,10 +86,17 @@ class OnnxWrapper:
 
 
 class _Silero:
+    """Silero VAD 带循环状态：每条音频流（VAD、KWS 各一个线程）要用自己的实例，
+    不同流的帧交替送进同一个实例会互相污染状态。"""
+
     def __init__(self) -> None:
         self.model = OnnxWrapper(
             path=get_model_file_path("silero_vad.onnx"),
         )
+
+    def reset(self):
+        """清掉循环状态（新的一段监听开始时调用）。"""
+        self.model.reset_states()
 
     def vad(self, frames, sample_rate):
         try:
@@ -106,6 +113,12 @@ class _Silero:
             logger.error(f"sample_rate: {sample_rate}", module="SileroVAD")
             logger.debug(traceback.format_exc(), module="SileroVAD")
             return None
+
+
+
+def create_silero() -> _Silero:
+    """新建一个独立状态的 Silero（模型文件很小，每个线程一份）。"""
+    return _Silero()
 
 
 Silero = _Silero()

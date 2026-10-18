@@ -37,6 +37,9 @@ class _VAD:
         self.silence_frames = []  # 静音片段
         self.speech_frames = []  # 语音片段
         self.target = None  # 检测目标 speech/silence
+        # 判定开口时读到的位置：接着等说完（resume("silence")）时从这里继续，
+        # 回放历史时缓冲区里积压的后半句不会被清掉
+        self._speech_end: int | None = None
 
         self.apply_runtime_config()
         self.config_manager.add_reload_listener(self._on_config_reload)
@@ -78,30 +81,53 @@ class _VAD:
         self._reset_state()
         self.stream.stop_stream()
 
-    def resume(self, target: str, preroll_from: int | None = None):
+    def resume(
+        self,
+        target: str,
+        preroll_from: int | None = None,
+        replay_from: int | None = None,
+    ):
         """恢复VAD检测
 
-        preroll_from: GlobalStream 的绝对采样位置。设置后，从该位置到现在已经收到的
-        音频会作为"说话前的静音片段"放在开头（打断后补回唤醒词之后已经说出的话）。
+        replay_from: GlobalStream 的绝对采样位置。从这里到现在已经收到的音频重新过一遍检测
+            （允许抢话：唤醒词刚说完、播报刚结束就开口，已经说出的部分不丢）。
+        preroll_from: 只在 target="speech" 时有效。[preroll_from, replay_from 或现在) 之间的音频
+            不做检测，作为"开口前的静音片段"放在语音开头（补上唤醒词末尾一点，识别更稳）。
         """
+        speech_end, self._speech_end = self._speech_end, None
+        if target == "speech":
+            # 新的一轮监听从干净的 Silero 状态开始；"silence" 是同一句话的后半段，状态保留。
+            # （OwnDing 实测：状态一直不清，运行几小时后清楚的一句话也会被判成静音。）
+            Silero.reset()
+        elif (
+            replay_from is None
+            and speech_end is not None
+            and GlobalStream.samples - speech_end < 2 * self.sample_rate
+        ):
+            # 同一句话的后半段：从判定开口时读到的位置接着读，不丢积压的音频
+            replay_from = speech_end
         self.paused = False
         self.target = target
         self._reset_state()
-        self.stream.clear_input()  # discard stale audio + reset read cursor
+        self.stream.stop_stream()  # 清掉旧缓冲（stop 会清空输入并重置读指针）
         if preroll_from is not None and target == "speech":
-            preroll = GlobalStream.since(preroll_from)
+            end = replay_from if replay_from is not None else GlobalStream.samples
+            preroll = GlobalStream.between(preroll_from, end)
             self.silence_frames = list(preroll[-2 * self.sample_rate :])
-        self.stream.start_stream()
+        self.stream.start_stream(since=replay_from)
 
-    def _speech_threshold(self) -> float:
-        """回声残留期间提高说话判定阈值。"""
+    def _speech_threshold(self, position: int | None = None) -> float:
+        """回声残留期间提高说话判定阈值；position 是这一帧在 GlobalStream 里的起点。"""
         if self.echo_threshold is None:
             return self.threshold
         xiaoai = get_xiaoai()
-        echo_active = getattr(xiaoai, "echo_active", None)
-        if echo_active and echo_active():
-            return max(self.threshold, self.echo_threshold)
-        return self.threshold
+        echo_active_at = getattr(xiaoai, "echo_active_at", None)
+        if position is not None and echo_active_at:
+            active = echo_active_at(position)
+        else:
+            echo_active = getattr(xiaoai, "echo_active", None)
+            active = bool(echo_active and echo_active())
+        return max(self.threshold, self.echo_threshold) if active else self.threshold
 
     def _handle_speech_frame(self, frames):
         """处理语音帧"""
@@ -124,6 +150,7 @@ class _VAD:
             self.target == "speech"
             and self.speech_count > self.min_speech_duration * self.sample_rate / 1000
         ):
+            self._speech_end = self.stream.position()
             self.pause()
             EventManager.on_speech(speech_bytes)
 
@@ -200,15 +227,17 @@ class _VAD:
                 time.sleep(0.01)
                 continue
 
-            # 检测是否是语音
+            # 检测是否是语音（回放历史时按这一帧原来的位置判断是否还在回声残留期）
+            position = self.stream.position() - self.frame_size
             speech_prob = Silero.vad(frames, self.sample_rate) or 0
-            is_speech = speech_prob >= self._speech_threshold()
+            is_speech = speech_prob >= self._speech_threshold(position)
             if is_speech:
                 self._handle_speech_frame(frames)
             else:
                 self._handle_silence_frame(frames)
 
-            time.sleep(0.01)
-
+            # 回放历史时缓冲区里还有积压，先追上再休息
+            if self.stream.unread_samples() < self.frame_size:
+                time.sleep(0.01)
 
 VAD = _VAD()
