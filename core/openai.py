@@ -5,8 +5,9 @@ including Hermes Agent API server mode.
 """
 
 import asyncio
+import json
 import uuid
-from typing import Any
+from typing import Any, AsyncIterator
 
 import aiohttp
 
@@ -36,6 +37,8 @@ class OpenAIManager:
     _max_tokens: int | None = None
     _timeout = 120
     _history_max_messages = 20
+    # 连续对话用流式回复（SSE）：第一句出来就播，还能收到 Hermes 的工具进度事件
+    _stream = True
     _extra_body: dict[str, Any] = {}
     _tts_provider: str | None = None
     _tts_speaker = None
@@ -97,6 +100,7 @@ class OpenAIManager:
         cls._system_prompt = str(config.get("system_prompt", "") or "")
         cls._timeout = int(config.get("response_timeout", 120))
         cls._history_max_messages = max(0, int(config.get("history_max_messages", 20)))
+        cls._stream = bool(config.get("stream", True))
         cls._temperature = cls._optional_float(config.get("temperature"))
         cls._max_tokens = cls._optional_int(config.get("max_tokens"))
         cls._extra_body = config.get("extra_body", {})
@@ -153,6 +157,113 @@ class OpenAIManager:
         if not cls._initialized:
             cls.initialize_from_config()
         return cls._enabled
+
+    @classmethod
+    def supports_streaming(cls) -> bool:
+        """连续对话是否走 stream_reply()。"""
+        return cls.is_enabled() and cls._stream
+
+    @classmethod
+    async def stream_reply(cls, text: str) -> AsyncIterator[tuple[str, Any]]:
+        """流式请求一轮对话，边收边产出事件：
+
+        - ("text", str)：正文增量（delta.content；模型的 reasoning_content 不要）
+        - ("tool", dict)：Hermes 的 `event: hermes.tool.progress`，
+          {"tool", "emoji", "label", "toolCallId", "status": "running" | "completed"}
+
+        结束后（包括调用方中途停止 / 被取消）把已经收到的回复记进历史。
+        请求失败时抛异常（last_error 同步设置）。
+        """
+        if not cls._initialized:
+            cls.initialize_from_config()
+        if not cls._enabled:
+            raise RuntimeError("OpenAI backend is disabled")
+
+        session_key = cls._session_key
+        history = cls._sessions.setdefault(session_key, [])
+        payload = cls._build_payload(history, text, stream=True)
+        module = f"OpenAI({session_key})"
+        logger.user_speech(text, module=module)
+        cls.last_error = None
+        parts: list[str] = []
+        completed = False
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=cls._timeout)
+            ) as session:
+                async with session.post(
+                    cls._chat_completions_url(), json=payload, headers=cls._headers()
+                ) as response:
+                    content_type = response.headers.get("Content-Type", "unknown")
+                    if response.status >= 400:
+                        raise RuntimeError(
+                            f"HTTP {response.status}: 后端服务请求失败 (Content-Type={content_type})"
+                        )
+                    if "text/event-stream" not in content_type:
+                        # 服务端不支持流式，直接回了完整 JSON
+                        try:
+                            body = await response.json(content_type=None)
+                        except ValueError as exc:
+                            raise RuntimeError(
+                                f"HTTP {response.status}: 后端返回了非 JSON 响应 (Content-Type={content_type})"
+                            ) from exc
+                        reply = cls._extract_response_text(body)
+                        completed = True
+                        if reply:
+                            parts.append(reply)
+                            yield ("text", reply)
+                        return
+
+                    event = None
+                    async for raw in response.content:
+                        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                        if not line:
+                            event = None  # 一个 SSE 事件结束
+                            continue
+                        if line.startswith(":"):
+                            continue
+                        if line.startswith("event:"):
+                            event = line[6:].strip()
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            completed = True
+                            break
+                        try:
+                            obj = json.loads(data)
+                        except ValueError:
+                            logger.debug(f"[OpenAI] Skipping non-JSON SSE data: {data[:80]}")
+                            continue
+                        if event == "hermes.tool.progress":
+                            if isinstance(obj, dict):
+                                yield ("tool", obj)
+                            continue
+                        if isinstance(obj, dict) and obj.get("error"):
+                            raise RuntimeError(f"后端返回错误: {obj['error']}")
+                        delta = cls._extract_delta_text(obj)
+                        if delta:
+                            parts.append(delta)
+                            yield ("text", delta)
+                    else:
+                        completed = True  # 连接正常结束但没有 [DONE]
+        except asyncio.CancelledError:
+            raise
+        except GeneratorExit:
+            raise
+        except Exception as exc:
+            cls.last_error = f"{type(exc).__name__}: {exc}"
+            logger.error(f"[OpenAI] Streaming chat completion failed: {cls.last_error}")
+            raise
+        finally:
+            reply = "".join(parts).strip()
+            if reply:
+                cls._append_history(history, text, reply)
+                if completed:
+                    logger.ai_response(reply, module=module)
+                else:
+                    logger.info(f"[OpenAI] Reply stopped early: {reply[:60]}")
 
     @classmethod
     def set_session_key(cls, session_key: str):
@@ -276,18 +387,7 @@ class OpenAIManager:
     async def _request_chat_completion(cls, text: str) -> str | None:
         session_key = cls._session_key
         history = cls._sessions.setdefault(session_key, [])
-        messages = cls._build_messages(history, text)
-        payload: dict[str, Any] = {
-            "model": cls._model,
-            "messages": messages,
-            "stream": False,
-            **cls._extra_body,
-        }
-        if cls._temperature is not None:
-            payload["temperature"] = cls._temperature
-        if cls._max_tokens is not None:
-            payload["max_tokens"] = cls._max_tokens
-
+        payload = cls._build_payload(history, text, stream=False)
         headers = cls._headers()
 
         async with aiohttp.ClientSession(
@@ -316,6 +416,42 @@ class OpenAIManager:
         if response_text:
             cls._append_history(history, text, response_text)
         return response_text
+
+    @classmethod
+    def _build_payload(cls, history: list[dict[str, str]], text: str, stream: bool) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": cls._model,
+            "messages": cls._build_messages(history, text),
+            "stream": stream,
+            **cls._extra_body,
+        }
+        if cls._temperature is not None:
+            payload["temperature"] = cls._temperature
+        if cls._max_tokens is not None:
+            payload["max_tokens"] = cls._max_tokens
+        return payload
+
+    @classmethod
+    def _extract_delta_text(cls, chunk: Any) -> str:
+        """从 chat.completion.chunk 里取正文增量（不取 reasoning_content）。"""
+        if not isinstance(chunk, dict):
+            return ""
+        choices = chunk.get("choices")
+        if not choices or not isinstance(choices[0], dict):
+            return ""
+        delta = choices[0].get("delta")
+        if not isinstance(delta, dict):
+            return ""
+        content = delta.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            return "".join(
+                item.get("text", "")
+                for item in content
+                if isinstance(item, dict) and item.get("type") == "text"
+            )
+        return ""
 
     @classmethod
     def _headers(cls) -> dict[str, str]:

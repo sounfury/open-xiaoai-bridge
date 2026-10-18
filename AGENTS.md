@@ -30,7 +30,11 @@ open-xiaoai-bridge/
 │   │   ├── speaker.py             # SpeakerManager 音箱硬件控制
 │   │   ├── api_server.py          # HTTP REST API（aiohttp）
 │   │   ├── conversation_light.py  # 连续对话灯效（状态驱动、后台切换）
+│   │   ├── light_level.py         # 聆听灯随麦克风音量起伏（推噪声给音箱 vis）
 │   │   ├── tts/router.py           # 统一 TTS provider 路由与播放
+│   │   ├── tts/wake_reply.py       # 唤醒 / 打断后的应答语（小爱原生 TTS 生成后缓存在音箱 /tmp）
+│   │   ├── tts/segmenter.py        # 流式回复切段 + 朗读前清理（Markdown / <think> / 开头英文）
+│   │   ├── tts/segment_player.py   # 分段播放（小爱原生预生成流水线 / 按段回调）
 │   │   ├── audio/
 │   │   │   ├── stream.py          # GlobalStream 全局音频流（多路输入广播，保留最近 3 秒）
 │   │   │   ├── aec.py             # 子带回声消除（移植自 OwnDing/open-xiaoai）
@@ -154,14 +158,29 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 7. 恢复监听
 
 **回声防护与播报中打断**（`barge_in` 配置，实现在 `core/external_conversation.py`）:
-- 回采在线（`barge_in.enabled` 且 `XiaoAI.echo_reference_live()`）时：播报期间**不关麦**，回声由 `core/services/audio/aec.py` 消除；KWS 通过 `arm_barge_in(handler)` 在暂停状态下继续检测，命中后先切灯，再用自己持有的 `playback_token` 停 TTS、后台 `stop_device_audio()`，直接进入下一轮（不播提示音）
+- 回采在线（`barge_in.enabled` 且 `XiaoAI.echo_reference_live()`）时：播报期间**不关麦**，回声由 `core/services/audio/aec.py` 消除；KWS 通过 `arm_barge_in(handler)` 在暂停状态下继续检测，命中后先切灯，再用自己持有的 `playback_token` 停 TTS；启用打断应答语时先等待 `stop_device_audio()` 完成，再随机说一句应答语（"我在"/"在"/"哎"…，`conversation.wake_reply.on_barge_in`）后进入下一轮；关闭应答语时后台停播并继续监听
 - 打断命中位置（`GlobalStream` 绝对采样位置）往前 `speech_lookback_ms` 作为下一轮 `VAD.resume("speech", preroll_from=...)` 的预录，"你好缪斯，明天天气怎么样"后半句不丢；ASR 结果去掉句首唤醒词
 - 回声残留期间（播放中及停播后 `echo_vad_hangover_ms`）VAD 用更高的 `echo_vad_threshold`
 - 回采不在线时退回旧方式：`stop_recording` → kill 远端 arecord → 麦克风物理静音，TTS 和提示音都在关麦期间播放
 - `VAD.resume()` 会自动 `_reset_state()` + `input_bytes.clear()`，清除旧的 `speech_frames` 和音频流缓冲（带 `preroll_from` 时再从 `GlobalStream` 历史补回）
 
+**流式回复和分段播报**（后端 `supports_streaming()` 为真时，目前只有 OpenAI / Hermes）:
+- `OpenAIManager.stream_reply(text)` 产出 `("text", delta)` / `("tool", hermes.tool.progress)`；只取 `delta.content`，不取 `reasoning_content`；结束或被取消时把已收到的回复记进历史
+- `ReplyStream` 在后台读流（创建即发请求，和"咻"并行）；`_speak_stream` 用 `core/services/tts/segmenter.py` 切段，送进 `core/services/tts/segment_player.py`
+- `tts_speaker == "xiaoai"`：`XiaoAINativeSegmentPlayer`（`mibrain text_to_speech save=1` 预生成 + `miplayer -f` 依次播放，临时文件 `/tmp/open-xiaoai-bridge-tts-*.mp3`）；其他 provider：`CallbackSegmentPlayer` 按段调 `_play_tts`
+- 工具开始、还没有正文时念一次 `openai.tool_filler`（"稍等" / "我查一下"）
+- 打断覆盖整个回复过程（包括后端还在思考）：取消 `_speak` 任务 → `player.abort()`（`killall miplayer`、删临时文件）+ `ReplyStream.close()`（断开 HTTP）
+- 分段播放一段都没播成（`player.error` 且 `played == 0`）时，整段退回 `_play_tts`
+
 **灯效**（`core/services/conversation_light.py`）:
-- 会话只调用 `_light_state(state)`：`listening` 9 → `hearing` 41（VAD 判定开口）→ `thinking` 2 → `speaking` 3 → `off`
+- OpenAI / 缪斯会话调用 `_light_state(state)`，和原生小爱一致：提示音 / 回答 `speaking` 3（跟播放音量起伏，miplayer 自带）→ `listening` / `hearing` 41（短白灯，随你的音量变宽）→ `thinking` 2 → `speaking` 3 → `off`；不再用黄灯 9
+- 聆听灯随音量（`core/services/light_level.py`，配置 `conversation.light_level`）：音箱 `vis` 从 `/tmp/mic_audio.fifo` 读 48 kHz PCM 算音量、UDP 发给 `ledd`；`ubus call mic_audio set_event '{"event":1,"value":1}'` 切到麦克风、`value:2` 切回播放。bridge 开 TCP 4400，音箱 `nc` 连进来写 FIFO；bridge 只送"同响度的噪声"，不送语音
+  - `vis` 要求输入不能明显慢于实时，否则关掉重开 FIFO，`nc` 写入 EPIPE 被杀：bridge 用自己的时钟每 110 ms 发一帧 9600 字节（不跟麦克风包走），音箱端 `nc` 被杀自动重连
+  - 不能比实时快太多，否则 FIFO 积压成延迟；当前保留小幅噪声作为静音底值；噪声 RMS 约 8000 时实测 `vis` 偶发输出 0，具体原因未确认
+  - 宽度按"比跟踪到的底噪高多少 dB"算（`margin_db` / `span_db`），每轮 INFO 日志有一行"麦克风音量"
+  - 设备时钟比 bridge 主机快约 12 秒，对照音箱 strace 和 bridge 日志时注意换算
+- 应答语（`core/services/tts/wake_reply.py`，配置 `conversation.wake_reply`）：唤醒 / 打断后随机说一句代替"叮"；小爱原生 TTS 时首次用 `mibrain text_to_speech` 生成、存 `/tmp/open-xiaoai-bridge-reply-<hash>.mp3` 复用，`miplayer` 播。打断时必须先 `await stop_device_audio()` 再播（它会 `killall miplayer`）
+- 超时：`wakeup.timeout` 秒没开口就退出（播 after_wakeup 告别语）；等待期结束时若已经开口，则继续等待至多 `conversation.max_utterance_s` 秒
 - 后台任务按最新状态切灯，不阻塞语音流程；`set()` 可在 VAD/KWS 线程调用
 
 **VAD 状态泄漏陷阱**:
@@ -327,6 +346,11 @@ API_SERVER_ENABLE=1 uv run main.py
 - `set_vad/get_vad`, `set_kws/get_kws`, `set_speaker/get_speaker`
 - `set_audio_codec/get_audio_codec`, `set_speech_frames/get_speech_frames`
 
+### 本机运行注意
+- bridge 在跑时不要用 `uv run` / `uv sync`：它会重装项目包，`open_xiaoai_server.pyd` 被占用删不掉，重装中断后 `open_xiaoai_server/__init__.py` 会丢，下次启动报 `no attribute 'register_fn'`。跑脚本直接用 `.venv/Scripts/python.exe`
+- 已经弄坏时：从 `dist-migration/*.whl` 取回 `open_xiaoai_server/__init__.py`（或 `uv pip install --force-reinstall --no-deps` 这个 wheel，需先停 bridge）
+- 重启：结束 `start-bridge.bat` 的 cmd 进程树，再 `schtasks /Run /TN \OpenXiaoAI-Bridge`；日志在 `logs/bridge-autostart.log`
+
 ### 兼容约束
 - `CLI` 环境变量不再作为功能开关，不要引入依赖 `CLI` 的运行时分支
 - `XIAOZHI_ENABLE=0` 时必须允许跳过 KWS 初始化
@@ -347,6 +371,7 @@ API_SERVER_ENABLE=1 uv run main.py
 |------|-----------|---------|---------|
 | PCM 直通 | `aplay` | `open_xiaoai_server.start_playing()` → WebSocket stream | `open_xiaoai_server.stop_playing()` |
 | 阻塞 TTS | `tts_play.sh` → `miplayer -f <file>` | `speaker.play(blocking=True)` | `killall tts_play.sh miplayer` |
+| 分段 TTS（流式回复） | `miplayer -f /tmp/open-xiaoai-bridge-tts-*.mp3` | `XiaoAINativeSegmentPlayer`（先 `mibrain text_to_speech save=1` 生成） | `player.abort()` / `killall miplayer` |
 | 非阻塞 TTS | `mibrain_service` (内部播放) | `speaker.play(blocking=False)` → `ubus call mibrain text_to_speech` | `mphelper pause`（不一定可靠） |
 | 媒体播放器 | `mediaplayer` (系统守护进程) | `ubus call mediaplayer player_play_url` | `mphelper pause` / `ubus call mediaplayer player_play_operation '{"action":"pause"}'` |
 

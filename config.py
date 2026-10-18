@@ -135,12 +135,52 @@ APP_CONFIG = {
         # 唤醒后 / 每轮回答播完后播提示音。有回采时提示音不耽误听：这期间说的话会回放给 VAD
         "start_sound": True,
         "next_turn_sound": True,
+        # 唤醒 / 打断后随机说一句应答语（和原生小爱一样），代替唤醒时的"叮"。
+        # 小爱原生 TTS 时用小爱自己的声音：第一次在音箱上生成并缓存，之后直接播；其他 TTS 用对应的 TTS 合成。
+        # 失败时退回"叮"。唤醒时的应答还受 start_sound 控制
+        "wake_reply": {
+            "enabled": True,
+            "phrases": ["我在", "在", "哎", "在呢", "我在听"],
+            "on_wake": True,  # 喚醒时
+            "on_barge_in": True,  # 播报中被喚醒词打断时
+        },
+        # 一句话最长录多久（秒）。wakeup.timeout 只管"多久没开口就退出"，已经在说的不受它限制
+        "max_utterance_s": 60,
         # 回答播完后跳过这么长再开始听（避开播报的最后一点余音），ms
         "tts_end_guard_ms": 150,
         # 唤醒词认出时已经过去一小段，从认出的位置往回这么多开始听（"你好缪斯，开灯"），ms
         "keyword_tail_ms": 100,
         # 没有回采、重新开麦后丢掉开头这么长（可能带着提示音余音），ms
         "mic_start_skip_ms": 150,
+        # 断句：停顿这么久算说完（只用于连续对话，vad.min_silence_duration 给小智流程用），ms
+        "end_silence_ms": 800,
+        # 停顿时先识别一遍，像没说完（"今天会很"、"帮我把"、"那个"）就接着听，静音总共等到这么久，ms；
+        # 规则见 core/utterance.py。设成和 end_silence_ms 一样就关闭
+        "hesitation_silence_ms": 1800,
+        # 流式回复怎么切段（openai.stream=True 时）：第一段尽快播，后面攒长一点少停顿
+        "reply_segments": {
+            "first_min_chars": 8,  # 第一段在句号处就出；在逗号处切需要至少这么多字
+            "target_chars": 60,  # 后面的段攒到这么多字，在标点处切
+            "max_chars": 120,  # 一段最长
+            "flush_delay_ms": 250,  # 流停住这么久，已经完整的句子先播
+            "stall_force_ms": 1200,  # 流停住这么久，没有标点也先播
+        },
+        # 灯随你说话的音量起伏（和原生小爱一样，见 core/services/light_level.py）：
+        # 音箱用 nc 连到 bridge 的 port，bridge 只送音量（同响度的噪声），不送语音内容
+        "light_level": {
+            "enabled": True,
+            "port": 4400,
+            "states": ["listening", "hearing"],  # 这些状态让灯跟麦克风走；播报时灯跟 TTS 走（设备自带）
+            # 按"比环境底噪高多少"算宽度（底噪自动跟踪，和麦克风增益无关）；每轮日志有一行"麦克风音量"可参考
+            "margin_db": 3,  # 比底噪高这么多 dB 开始变宽
+            "span_db": 18,  # 再高这么多 dB 白光全宽
+            "max_rms": 4000,  # 送给 vis 的最大噪声；vis≈RMS/85，25 左右白光已全宽，8000 以上会偶发溢出成 0
+        },
+        # 小爱原生 TTS 分段播放（mibrain 提前生成 + miplayer 依次播放）
+        "native_tts": {
+            "prefetch_segments": 2,  # 最多提前生成几段
+            "generate_timeout_ms": 8000,
+        },
     },
     "audio_input": {
         # 进入 VAD/KWS/ASR 前放大麦克风输入，1.0 = 不放大。
@@ -288,9 +328,11 @@ APP_CONFIG = {
         "api_key": "",
         "model": "muse-home",
         "listening_light": {
-            "enabled": True,  # 等你说 9 → 听到你在说 41 → 思考 2 → 播报 3，退出时熄灭（见 core/services/conversation_light.py）
-            "effect_id": 9,  # OH2P 固件 noangle 监听灯效
-            "hearing_effect_id": 41,  # 听到你在说：固件 wakeup.sh 的 asrstart 灯效
+            # 和原生小爱一样：提示音 / 播报 3 → 等你说、你在说 41（短白灯，随你的音量变宽）→ 思考 2 → 播报 3，
+            # 退出时熄灭（见 core/services/conversation_light.py）
+            "enabled": True,
+            "effect_id": 41,  # 等你说：固件 wakeup.sh 的 asrstart 灯效（原来的黄灯是 9）
+            "hearing_effect_id": 41,  # 你在说：同一个灯，只是有了音量
             "thinking_effect_id": 2,  # 固件 wakeup.sh 的 think 灯效
             "speaking_effect_id": 3,  # 播报中（可打断）：固件 wakeup.sh 的 speek 灯效
         },
@@ -311,6 +353,17 @@ APP_CONFIG = {
         "max_tokens": 512,
         "history_max_messages": 20,
         "response_timeout": 120,
+        # 连续对话用流式回复：第一句出来就播（切段见 conversation.reply_segments）；False = 等整段回复再播
+        "stream": True,
+        # 后端开始调用工具、还没有正文时先念一句（每轮最多一次，需要 Hermes 的 hermes.tool.progress 事件）
+        "tool_filler": {
+            "enabled": True,
+            "text": "稍等",
+            # 工具名包含键时用对应的话；设成 "" 表示这类工具不插话
+            "tool_texts": {"web_search": "我查一下", "web_extract": "我查一下"},
+            # 这些工具不算（tool_describe 只是读工具说明，每次调用工具前都有）
+            "ignore_tools": ["tool_describe"],
+        },
         "tts_speed": 1.0,
         "tts_speaker": "xiaoai",
         "session_tts_speakers": {},

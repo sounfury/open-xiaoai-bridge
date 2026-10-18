@@ -1,6 +1,6 @@
 # 迁移方案：把 OwnDing/open-xiaoai 的能力移植进本项目
 
-> 状态：阶段 1、2 已完成并在真机验收；阶段 3 + 4 代码完成、离线验收通过、已部署，待真机验收；新增阶段 8（调教 Hermes）。最后更新：2026-10-18。
+> 状态：阶段 1～5 已完成实机功能验收，当前版本作为上线基线提交；阶段 3 的长时间唤醒率统计仍待补充。原阶段 6 与阶段 8 合并为云端 Hermes 调教，待实施；主动播报直接使用米家云接口。最后更新：2026-10-18。
 > 参考项目：[OwnDing/open-xiaoai](https://github.com/OwnDing/open-xiaoai)（基于 commit `7ecea6f`，MIT）。
 
 ## 1. 背景与目标
@@ -26,9 +26,8 @@ OH2P（OwnDing 客户端：麦克风 + 播放回采，二进制音频帧）
   ⇄ open-xiaoai-bridge（Windows 本机，:4399）
       回声消除 → 唤醒检测 / VAD → 本地 SenseVoice 识别
       → Hermes（流式）→ 分句 → 小爱原生 TTS 分段播放
-      /api/play/text（只监听 127.0.0.1:9092）
-          ▲ cloudflared 隧道（复用 AgentDock 的隧道，新增一个域名）
 Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce）
+                              └ 米家云端播报 → OH2P（主动提醒，无需本机 bridge 在线）
 ```
 
 ## 2. 要什么、不要什么
@@ -139,36 +138,17 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
 3. 移植：搜索时先念"我查一下"、去掉开头英文。
 4. 工具校验先不做；上线后观察 Hermes 会话记录。注意本项目本地保存的历史也只有文字，存在"模型照抄以前的'灯关了'"的风险。
 
-### 阶段 6：主动播报（走 bridge 的 `/api/play/text`）
+### 阶段 6：云端 Hermes 调教（主动播报、米家、Spotify、记忆和定时）
 
-现状：对话回复是 bridge 拉取 Hermes 回复后在进程内播放；**主动播报没有通路**——Hermes 在 Oracle 上，碰不到只监听 `127.0.0.1:9092` 的 bridge。以前小爱管家能播，是 Grok 通过本机的 AgentDock 调用的。
-
-1. bridge 设置 `API_SERVER_TOKEN`，监听地址保持 `127.0.0.1`。
-2. 复用本机 AgentDock 的 cloudflared 命名隧道（`agent.sounfury.me`），新增一个域名指向 `http://127.0.0.1:9092`，再加 Cloudflare Access 服务令牌。需先确认 AgentDock 是否允许另加域名。
-3. Oracle 的 `home_tools` 新增 `speaker_announce(text, urgent=False)`：调用上面的地址；勿扰时段在工具里判断；调不通时改走 mijiaAPI 云端播报，指定 OH2P（did `2181631827`）。
-4. bridge 的 `/api/play/text` 加排队：正在对话或播报时先等这一轮结束。
-5. SOUL.md 写明"提醒和定时任务到点后用 `speaker_announce`"；实测定时任务能调到 `home_tools`（现在 `platform_toolsets.cron` 只有 `[memory]`）。
-
-不采用的做法：让 Hermes 直接连 AgentDock 的 MCP。AgentDock 能操控整台电脑，等于给语音助手和无人值守的定时任务开了终端权限。
-
-### 阶段 7：路由和清理
-
-1. `before_wakeup`：命中"你好缪斯"（本地 KWS 或小爱 ASR 以"缪斯"开头）返回 `"openai"`，不再走 muse webhook。
-2. 启动脚本：`OPENAI_ENABLE=1`，不设 `MUSE_ENABLE`。
-3. muse、OpenClaw、QwenPaw 代码先保留但不启用。
-4. 更新 README 和 AGENTS.md。
-
-### 阶段 8：调教 Hermes（米家、Spotify、Windows）
-
-这一阶段不属于 OwnDing 移植，放在这里是为了和前面的阶段统一排期。米家和 Spotify 只改 Oracle 端：`~/hermes/profile` 的 SOUL.md 和 config.yaml、`home_tools/server.py`、`~/home-tools/mijia/service`。Windows 控制要在 bridge 加接口。
+原阶段 6（主动播报）和阶段 8（调教 Hermes）合并为本阶段。主要改 Oracle 端：`~/hermes/profile` 的 SOUL.md 和 config.yaml、`home_tools/server.py`、`~/home-tools/mijia/service`；统一验收主动提醒、设备控制、记忆和定时任务。Windows 控制还需要本机 bridge 配合，作为单独的后续扩展，不阻塞云端功能上线。
 
 #### 用户故事（来自旧方案，需求保留）
 
 | 编号 | 场景 | 期望 | 怎么实现 |
 |---|---|---|---|
-| S2 | "你好缪斯，我今晚想洗澡" | 先说"稍等"；按我平常的入睡时间安排热水器提前加热，播报"已安排 xx 点开始加热" | 入睡时间从 Hermes 记忆里取；用 Hermes cron 定时打开（见 8.1）；"稍等"在阶段 5 做 |
+| S2 | "你好缪斯，我今晚想洗澡" | 先说"稍等"；按我平常的入睡时间安排热水器提前加热，播报"已安排 xx 点开始加热" | 入睡时间从 Hermes 记忆里取；用 Hermes cron 定时打开（见 6.2）；"稍等"在阶段 5 做 |
 | S4 | "你好缪斯，打开热水器 / 电热毯" | 直接执行，同时安排兜底：没收到"关 / 洗完了"先提醒，超时自动关 | 提醒和超时自动关用 Hermes cron；`mijia-service` 现有的 3 小时硬上限保留作兜底；热水器要先接入 |
-| S5 | "你好缪斯，播放 Spotify / 打开 xx 软件" | 在 Windows 上执行 | 改走 bridge 的白名单接口，不走 AgentDock（理由见阶段 6） |
+| S5 | "你好缪斯，播放 Spotify / 打开 xx 软件" | 在 Windows 上执行 | 改走 bridge 的白名单接口，不走 AgentDock（理由见 6.4） |
 | S6 | 不在家，在聊天里发"把空调关了" | 直接控制米家，和 Windows 开没开机无关 | 米家服务本来就在 Oracle 上；要确认文字入口（Hermes 网页）也能调用 `home_tools` |
 | S7 | 长对话之后再让它控制米家 | 仍能正确调用 | 设备说明在 SOUL.md 和工具描述里，习惯在 Hermes 记忆里，两者每轮都会放进上下文，不依赖对话历史 |
 
@@ -198,7 +178,19 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
 - **个人习惯交给 Hermes 的记忆**：我平时怎么说它就怎么记（"记住我一般十一点半睡""空调我喜欢 26 度"），记忆里没有时它问一次再记下，不手写进配置。SOUL.md 只写设备怎么用、家规，以及什么时候该去用记忆。
 - **设备说明写在 SOUL.md 和工具描述里**：这是系统配置，不是习惯，每轮都在上下文里。
 
-#### 8.1 米家：执行方式不变，补提示词和定时
+#### 6.1 主动播报：直接使用米家云端接口
+
+Oracle 上已有米家服务，主动提醒直接通过 mijiaAPI 让 OH2P（did `2181631827`）播报。Windows 和 bridge 无需在线，也无需为播报新增公网域名、cloudflared 隧道或 bridge 播放队列。
+
+1. 检查 `home_tools` 当前暴露的米家播报工具；已有就复用，缺少时只补一个 `speaker_announce(text, urgent=False)`，内部调用现有米家云端播报接口。
+2. 明确勿扰策略：优先核实云端播报是否遵守设备勿扰；需要额外规则时在工具里处理，普通提醒默认遵守勿扰，`urgent` 的例外需按确认的策略执行。
+3. 工具如实返回云端接口结果。云端接受请求不能当作已经实际播完，不为缺少播放完成回执另建一条 bridge 通路。
+4. SOUL.md 写明提醒和定时任务使用该播报工具；实测 Hermes cron 能调用 `home_tools`（当前 `platform_toolsets.cron` 只有 `[memory]`，不能仅凭配置推断可用）。
+5. 验收即时播报、定时提醒、Windows 关机时播报，以及勿扰和设备离线时的行为；同时观察与正在进行的语音对话是否冲突。
+
+原方案走 bridge 是为了复用本地 TTS、统一排队和播放状态；这些不是当前提醒播报的必要条件。云端播报与本地对话的播放协调先实测，出现具体问题后再决定是否增加协调机制。`/api/play/text` 保留现有用途，阶段 6 不向公网暴露它。
+
+#### 6.2 米家：执行方式不变，补提示词和定时
 
 **为什么不改回 skill + CLI**：
 
@@ -217,7 +209,7 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
    - 需要习惯的操作先看记忆。例如开空调没说温度就用记忆里的偏好；安排热水器用记忆里的入睡时间和加热时长；只说"开空调"时按季节选模式。
    - 记忆里没有时只问一次，例如"你一般几点睡？"，回答后记下来，下次不再问。
    - 我说"以后……""我一般……""我喜欢……"时更新记忆；同一件事只留最新的一条。
-   - 只把关于我的稳定偏好记进 USER.md。工具缺陷、系统故障不进记忆（8.2 做完后删掉现有那条 Spotify 缺陷）。
+   - 只把关于我的稳定偏好记进 USER.md。工具缺陷、系统故障不进记忆（6.3 做完后删掉现有那条 Spotify 缺陷）。
    - 记忆容量有限，只存精简的结论。
    - 验收：新会话里说一次"记住我工作日十一点半睡"，再说"我今晚想洗澡"，应该直接按十一点半安排，不再问。
 
@@ -242,7 +234,7 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
       - 只列出来发到 Hermes 网页聊天里等我确认，自己不删。
    4. **一次性清理**：
       - 删掉 `USER.md` 里「我的摇滚」那条。
-      - 8.2 做完后删掉 `MEMORY.md` 里两条 Spotify 工具笔记。
+      - 6.3 做完后删掉 `MEMORY.md` 里两条 Spotify 工具笔记。
       - 不手动写"摇滚歌单是 rock"：有了 `spotify_my_playlists` 以后，它能直接在我的歌单里找到 `rock`。
       - 评测加一条："放我的摇滚歌单"应该放我的 `rock`，不是搜到的公共歌单。
    5. **评测**：加一条用例。用识别错的艺人名点歌并播放成功后，检查记忆里只出现正确的名字。
@@ -261,14 +253,14 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
      - 超时：还开着就关掉。
      - 我说"洗完了 / 关掉"时，关设备，同时删掉这两个任务。
    - 任务里的指令要写完整：新会话看不到当前对话，要写明设备名和具体动作。这条写进 SOUL.md。
-   - 提醒要播报到音箱，需要一个播报工具。阶段 6 之前用米家云让 OH2P（did `2181631827`）播报，之后改走 bridge 的 `speaker_announce`。
+   - 提醒直接使用 6.1 的米家云端播报工具，让 OH2P（did `2181631827`）播报，不依赖 Windows 或 bridge 在线。
    - `mijia-service` 现有的"加热类最多开 3 小时"硬上限保留，作为 cron 没执行时的兜底。只补一点：服务启动时发现加热类开着，就重新计时。
    - 要先确认两件事：
      - cron 任务里确实能调用 `home_tools`。现在 `platform_toolsets.cron` 只列了 `memory`；全局 MCP 应该会自动带上，但 Hermes 有过一个 bug：单个任务另外指定工具集时，MCP 工具会全部丢失（issue #23997），要看 0.22.2 是否已修。
      - 语音入口（`api_server`）能用 `cronjob` 建任务：已在 `platform_toolsets.api_server` 里。
 5. 新增 `mijia_status()`：一次读出全屋状态，查询类问题一步就能答。
 
-#### 8.2 Spotify：补 MCP 工具
+#### 6.3 Spotify：补 MCP 工具
 
 1. `spotify_play` 增加 `uri` 参数：
    - 有 URI 直接播。
@@ -276,9 +268,9 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
    - 播放后核对实际在播的内容，不一致返回 `ok: false`。
 2. 新增 `spotify_my_playlists(query="")`，并支持播放"我喜欢的歌曲"。可能需要重新授权，补上 `playlist-read-private`、`user-library-read` 权限。
 3. 把 `spotify_ctl.py` 已有的 `queue`、`shuffle` 暴露成工具。
-4. 电脑上的 Spotify 没打开时，先调用 8.3 的接口打开它，再重试。
+4. 电脑上的 Spotify 没打开时，先调用 6.4 的接口打开它，再重试。
 
-#### 8.3 Windows 控制（S5）
+#### 6.4 后续扩展：Windows 控制（S5）
 
 - **动作白名单（已确认）**：
   - 系统音量：设置、加减、静音。
@@ -286,18 +278,18 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
   - 打开或关闭指定程序：先只有 Spotify，其余按需加。
   - 锁屏、关显示器、睡眠。
   - 关机：60 秒倒计时，可以说"取消关机"撤回。
-- **通道**：bridge 本来就跑在这台 Windows 上，在它的 API server 加 `/api/pc/*`，每个接口对应一条 Windows 自带命令（锁屏 `rundll32 user32.dll,LockWorkStation`，关机 `shutdown /s /t 60`，取消 `shutdown /a`，等等）。外网访问复用 AgentDock 已有的 cloudflared 隧道，和阶段 6 是同一条域名和同一个 Access 令牌。`home_tools` 新增 `pc_*` 工具。
+- **通道**：bridge 本来就跑在这台 Windows 上，在它的 API server 加 `/api/pc/*`，每个接口对应一条 Windows 自带命令（锁屏 `rundll32 user32.dll,LockWorkStation`，关机 `shutdown /s /t 60`，取消 `shutdown /a`，等等）。Oracle 到 Windows 的访问通道和鉴权在本阶段单独设计，可评估复用 AgentDock 已有的 cloudflared 隧道；不依赖阶段 6 的米家云播报。`home_tools` 新增 `pc_*` 工具。
 - **不让 Hermes 直连 AgentDock**：AgentDock 没有按工具或按令牌的权限控制。它的令牌就是全权限，执行命令和改文件的工具一直开着，审批也只针对 Coding Agent。直连等于 Oracle 上存着一个能完全控制这台电脑的令牌，网页内容里的注入指令也可能被执行。
 - **不做**：执行任意命令、读写文件、任意键盘鼠标操作（音量键、媒体键由接口内部按固定的键）、浏览网页。
 
-#### 8.4 模型和运行参数
+#### 6.5 模型和运行参数
 
 1. 看 Hermes 能否把 `home_tools` 的工具定义直接放进上下文（不懒加载），省掉每次的 `tool_describe`。
 2. `max_turns` 6 → 15（改 `~/hermes/profile/config.yaml`，重新跑 `install.sh` 同步到 `data/config.yaml`，再重启容器）。留足余量给重试和一句话里有多个操作的情况。平均步数仍在评测里监控：上限放宽不等于允许绕远路。
 3. 用评测集对比 `deepseek-v4.1-flash` 和一个更强的模型，看正确率和首句延迟，再决定换不换，或者只在调用工具时用强模型。
 4. SOUL.md：回复短、少反问；失败时只说一次原因和下一步。
 
-#### 8.5 评测和验收
+#### 6.6 评测和验收
 
 - S2～S7 每条写成评测用例，再加 30 句左右常用口令，包括识别错字的写法（如"播放我的摇滚歌达"）。
 - 评测时：
@@ -310,12 +302,20 @@ Oracle：Hermes muse-home ─ home_tools（米家 / Spotify / speaker_announce�
 
 顺序：
 
-1. 8.1 第 1、2 条：核对设备，改 SOUL.md 里使用记忆的规则；然后我用语音或网页把习惯告诉它一遍，顺便验收记忆。
-2. 8.1 第 3～5 条和 8.2。
-3. 8.4。
-4. 8.3（等阶段 6 的隧道）。
+1. 6.1：复用米家云端播报，验收即时提醒、cron 到点播报和勿扰策略。
+2. 6.2 第 1、2 条：核对设备，改 SOUL.md 里使用记忆的规则；然后我用语音或网页把习惯告诉它一遍，顺便验收记忆。
+3. 6.2 第 3～5 条和 6.3。
+4. 6.5，结合 6.6 做云端功能评测和真机验收。
+5. 6.4 作为后续扩展（单独确认 Oracle 到 Windows 的通道和鉴权）。
 
 S2 的"稍等"跟阶段 5 一起做。
+
+### 阶段 7：路由和清理
+
+1. `before_wakeup`：命中"你好缪斯"（本地 KWS 或小爱 ASR 以"缪斯"开头）返回 `"openai"`，不再走 muse webhook。
+2. 启动脚本：`OPENAI_ENABLE=1`，保留 `MUSE_ENABLE=1` 以启用缪斯 KWS 词表和原生唤醒拦截。
+3. muse、OpenClaw、QwenPaw 代码先保留但不启用。
+4. 更新 README 和 AGENTS.md。
 
 ## 5. 执行顺序
 
@@ -325,18 +325,17 @@ S2 的"稍等"跟阶段 5 一起做。
 | 2 | 阶段 2（已提前完成） | 依赖阶段 1 |
 | 3 | 阶段 3 + 4 | 只改服务端，风险低，见效快 |
 | 4 | 阶段 5 | 改动独立 |
-| 5 | 阶段 6 | 可与 2～4 并行，主要在 Oracle 端 |
+| 5 | 阶段 6（合并原阶段 8） | 云端 Hermes 的主动播报、米家、Spotify、记忆、定时和模型参数统一实施；Windows 控制作为后续扩展 |
 | 6 | 阶段 7 | 收尾 |
-| 7 | 阶段 8 | 米家、Spotify、模型参数只改 Oracle 端，可以随时插队；Windows（8.3）依赖阶段 6 的隧道 |
 
 ## 6. 待确认
 
-1. AgentDock 的 cloudflared 隧道能否另加一个域名。
+1. 阶段 6.4：Oracle 到 Windows 的远程控制通道及鉴权，届时再评估是否复用 AgentDock 的 cloudflared 隧道。
 2. 勿扰时段：跟随音箱自己的勿扰设置，还是写死时间段。
 3. ~~回采声道在 ROM 1.62.2 上是否为索引 3~~：已确认（阶段 1）。
-4. 阶段 8.1：热水器和台灯是米家里的哪个设备（现在设备清单里都没有）。
-5. 阶段 8.2：Spotify 重新授权，补上读取个人歌单和收藏的权限。
-6. 阶段 8.4：能否接受换更强的模型（费用、延迟），等评测结果再定。
+4. 阶段 6.2：热水器和台灯是米家里的哪个设备（现在设备清单里都没有）。
+5. 阶段 6.3：Spotify 重新授权，补上读取个人歌单和收藏的权限。
+6. 阶段 6.5：能否接受换更强的模型（费用、延迟），等评测结果再定。
 
 ## 7. 进度记录
 
@@ -439,3 +438,45 @@ S2 的"稍等"跟阶段 5 一起做。
 - "拜拜"偶尔被识别成"白白"，不会退出。
 
 - 2026-10-18：**阶段 3 + 4 提交**（分支 `feat/ownding-migration`）。同时提前做了阶段 7 的一部分：`config.py` 删掉上游的龙虾 / 小黑 / 小爪 / 小智演示路由和告别语，`before_wakeup` 只留缪斯 → `"openai"`，`after_wakeup` 的 `"openai"` 告别语从"小黑，再见"改为"再见"。
+
+- 2026-10-18：**阶段 5 代码完成**，用真实 Hermes 流 + 模拟音箱离线验证，待真机验收。
+
+### 阶段 5 实测：Hermes 的流式回复（`muse-home`，2026-10-18）
+
+- 正文在 `delta.content`，开头常带 `
+
+`；模型的英文思考在单独的 `delta.reasoning_content`（计划里"去掉开头英文"指的就是它，不读这个字段即可）。
+- 工具进度是 `event: hermes.tool.progress`，`data` 为 `{"tool", "emoji", "label", "toolCallId", "status"}`，每个工具一条 `running` 一条 `completed`；每次调用真正的工具前都会先调 `tool_describe`。
+- 时间线：讲故事 2.6 s 出正文、1.3 s 内出完；查温度 2.75 s 开始调工具、6.9 s 出正文；查新闻 2.75 s 开始调工具、13.6 s 出正文。真正的工具开始到正文出来至少 2.5 s，"稍等"不会拖慢回答。
+
+### 阶段 5 改动
+
+| 文件 | 改动 |
+|---|---|
+| `core/openai.py` | `stream_reply()`：`stream: true`，解析 SSE，产出正文增量和 `hermes.tool.progress`；服务端回普通 JSON 时也能用；结束或中途取消时把已收到的回复记进历史。`openai.stream` 开关 |
+| `core/services/tts/segmenter.py`（新） | 切段：第一段到句号（或够 8 个字的逗号）就出；后面攒到 60 字左右在句末切，放不下一整句才在逗号处切；流停住 250 ms 先放完整句子。朗读前去掉 Markdown、链接、表情、`<think>`；开头整句英文在后面有中文时丢掉 |
+| `core/services/tts/segment_player.py`（新） | 移植 OwnDing `NativeXiaomiTTS`：`mibrain text_to_speech save=1` 提前生成最多 2 段，`miplayer` 依次播放；小米拒读（5328 字节）时逐句重试；`abort()` 杀 `miplayer` 并删临时文件。其他 TTS 按段依次播 |
+| `core/external_conversation.py` | 流式后端走 `ReplyStream` + `_speak_stream`；工具开始且还没正文时念 `openai.tool_filler`（"稍等"，搜索类"我查一下"）；打断覆盖整个回复过程（包括还在思考时）；流式时第一段真正开播才切到播报灯；分段播放整个失败时退回一次性 TTS |
+| `config.py` | `openai.stream`、`openai.tool_filler`、`conversation.reply_segments`、`conversation.native_tts` |
+
+离线验证（`.pi-tmp` 下的临时脚本，未提交）：
+
+- 切段：真实回复按 1～4 字随机切成 delta，20 种切法结果一致；URL、`10:30`、`1,000`、`3.5` 不会被切开。
+- 模拟音箱：查温度 4.9 s 念"稍等"、8.8 s 播正文；讲故事段间无等待；播放中取消后 `miplayer` 被杀、临时文件清空、HTTP 断开；后端 404 时 1 s 内念失败提示；豆包 TTS 按段播放。
+
+待观察 / 限制：
+
+- 打断时历史里记的是已经收到的全部回复，不只是已经播出来的部分。
+- 唤醒检测偶发需要重复或提高音量；本次上线保留现有 KWS / AEC 参数，未因单轮测试成功而宣称解决。
+
+### 上线基线验收（2026-10-18）
+
+- 真机验证流式分段讲故事、工具等待提示、播报中打断及退出；用户确认聆听白光会随人声音量变宽。
+- 灯效：聆听 / 说话均为白光 41，思考 2，播报 3；麦克风音量通过固定节奏的模拟噪声送入设备原生 vis，音箱 `nc` 可自动重连。
+- 唤醒及打断后随机应答（“我在”“在”“哎”等），配置 `conversation.wake_reply`；小爱原生音色在设备 `/tmp` 缓存后播放。
+- 断句默认静音 800 ms；识别为未完成句时延长至约 1800 ms；过滤纯语气词及仅包含唤醒词 / 尾音的识别结果。
+- 无人开口时默认 20 秒退出；说话跨过这一等待期限时继续等候，额外等待上限由 `conversation.max_utterance_s` 控制。长句和纯静音退出边界仍需专项实机验证。
+- 16:05 的一轮真机日志记录 5 次成功打断，KWS 命中到停播处理约 0.10～0.17 秒，应答语再过约 0.8～1.0 秒播完；不代表全部呼喊的命中率。
+- 3 分钟双声道录音离线比较：VAD 门控开启时命中 4 次，关闭时 5 次（包含初次唤醒）；关闭门控的处理耗时约为原来的 6 倍。离线连续检测没有复现线上每次武装时的状态重置，暂不据此修改线上设置。
+- 录音、SSH 密码辅助文件和临时模拟脚本不提交；临时录音已结束，密码辅助文件已删除。
+- 原阶段 6 与阶段 8 合并为云端 Hermes 调教；主动播报直接使用米家云端接口，Windows 控制另列为后续扩展。本次只调整计划，尚未改动 Oracle 上的工具或定时任务。

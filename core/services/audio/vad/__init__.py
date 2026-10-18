@@ -21,6 +21,9 @@ class _VAD:
         self.threshold = 0.01
         self.min_speech_duration = 250
         self.min_silence_duration = 500
+        # 调用方临时指定的"说完"静音时长（ms）；None = 用 min_silence_duration。
+        # 连续对话用它设自己的断句时长，不影响小智流程
+        self.silence_override_ms: int | None = None
         # 刚播放过声音时（回声消除后仍有残留），说话判定用这个更高的阈值；None = 不提高
         self.echo_threshold = None
 
@@ -173,9 +176,10 @@ class _VAD:
                 # 如果之前有语音片段，则将当前帧加入语音片段
                 self.speech_frames.extend(frames)
 
+        silence_ms = self.silence_override_ms or self.min_silence_duration
         if (
             self.target == "silence"
-            and self.silence_count > self.min_silence_duration * self.sample_rate / 1000
+            and self.silence_count > silence_ms * self.sample_rate / 1000
         ):
             self.pause()
             EventManager.on_silence()

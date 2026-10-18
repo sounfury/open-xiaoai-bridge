@@ -10,16 +10,21 @@
 - 灯效命令走设备 RPC（每次约 100～200ms），全部在后台执行；状态切换太快时只执行最后一个。
 - 一次命令里先关旧灯效再开新灯效；两个状态灯效相同时不发命令。
 - 播报时设备播放器会提前熄灯，speaking 状态每 0.5 秒检查一次，被关掉了就重新打开。
+- 随音量起伏（conversation.light_level）：level_states 里的状态让 vis 改读麦克风，并由
+  core/services/light_level.py 把麦克风音量送过去；离开时切回播放音源（播报灯跟着 TTS 动）。
+  听到你在说（41）和播报（3）的白光宽度都跟着音量变；等你说话（9，黄光）不受影响。
 """
 
 import asyncio
 
+from core.services.light_level import MIC_SOURCE_OFF, MIC_SOURCE_ON, MicLevelFeeder
 from core.utils.logger import logger
 
 LOG_MODULE = "Light"
 
 DEFAULT_EFFECTS = {
-    "listening": 9,
+    # 和原生小爱一样：等你说、你在说都是短白灯 41（有音量通道时随你的音量变宽）
+    "listening": 41,
     "hearing": 41,
     "thinking": 2,
     "speaking": 3,
@@ -68,10 +73,20 @@ def _shut(effect: int) -> str:
 class ConversationLight:
     """一次连续对话持有的灯。只关闭自己开过的灯效，不影响设备其他灯。"""
 
-    def __init__(self, speaker, effects: dict[str, int | None], loop: asyncio.AbstractEventLoop):
+    def __init__(
+        self,
+        speaker,
+        effects: dict[str, int | None],
+        loop: asyncio.AbstractEventLoop,
+        level_feeder: MicLevelFeeder | None = None,
+        level_states=("listening", "hearing"),
+    ):
         self._speaker = speaker
         self._effects = dict(effects)
         self._loop = loop
+        self._feeder = level_feeder
+        self._level_states = frozenset(level_states or ())
+        self._mic_on = False  # vis 当前读麦克风（我们切过去的）
         self._desired = "off"
         self._applied_effect: int | None = None
         self._changed = asyncio.Event()
@@ -116,11 +131,20 @@ class ConversationLight:
 
     # ===== 私有方法 =====
 
+    def _want_mic(self, state: str) -> bool:
+        return self._feeder is not None and state in self._level_states
+
+    def _settled(self) -> bool:
+        return (
+            self._effects.get(self._desired) == self._applied_effect
+            and self._want_mic(self._desired) == self._mic_on
+        )
+
     def _set(self, state: str):
         if self._closed:
             return
         self._desired = state
-        if self._effects.get(state) == self._applied_effect and state not in _REFRESH_STATES:
+        if self._settled() and state not in _REFRESH_STATES:
             return
         self._idle.clear()
         self._changed.set()
@@ -130,7 +154,7 @@ class ConversationLight:
     async def _wait_idle(self):
         while True:
             await self._idle.wait()
-            if self._effects.get(self._desired) == self._applied_effect:
+            if self._settled():
                 return
             self._idle.clear()
 
@@ -146,23 +170,42 @@ class ConversationLight:
                 self._idle.set()
                 await self._changed.wait()
             self._changed.clear()
-            target = self._effects.get(self._desired)
-            if target != self._applied_effect:
-                await self._apply(target)
-            if target == self._effects.get(self._desired):
+            state = self._desired
+            target = self._effects.get(state)
+            want_mic = self._want_mic(state)
+            if want_mic and not self._mic_on and self._feeder is not None and not self._feeder.ready:
+                # 第一次需要时让音箱连上音量通道：先把灯切好再连；连不上就整场对话不用，灯照常切
+                if target != self._applied_effect:
+                    await self._apply(target, self._mic_on)
+                if not await self._feeder.ensure_ready(self._speaker):
+                    self._feeder = None
+                    want_mic = False
+                if self._desired != state:
+                    continue
+            if target != self._applied_effect or want_mic != self._mic_on:
+                await self._apply(target, want_mic)
+            if self._settled():
                 self._idle.set()
 
-    async def _apply(self, target: int | None):
+    async def _apply(self, target: int | None, want_mic: bool = False):
         previous = self._applied_effect
         commands = []
-        if previous is not None:
+        if self._mic_on and not want_mic:
+            commands.append(MIC_SOURCE_OFF)
+        if previous is not None and previous != target:
             commands.append(_shut(previous))
-        if target is not None:
+        if target is not None and previous != target:
             commands.append(_show(target))
+        if want_mic and not self._mic_on:
+            commands.append(MIC_SOURCE_ON)
         # 先记下目标：即使命令失败，下次切换也会定向关掉它，不会留下常亮灯
         self._applied_effect = target
+        if want_mic != self._mic_on:
+            self._mic_on = want_mic
+            if self._feeder is not None:
+                self._feeder.set_active(want_mic)
         if commands:
-            await self._run("; ".join(commands), f"{previous} → {target}")
+            await self._run("; ".join(commands), f"{previous} → {target}{' +mic' if want_mic else ''}")
 
     async def _refresh(self, effect: int):
         command = (

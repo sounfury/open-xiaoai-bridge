@@ -541,6 +541,17 @@ if "让小黑" in text:
 
 `base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。连续对话会按 `session_key` 保存最近 `history_max_messages` 条上下文；需要隔离多个助手时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。
 
+### 流式回复和分段播报
+
+连续对话默认用流式回复（`"stream": True`）：
+
+- 回复边生成边切成段，第一句出来就开始播（切段参数见 `conversation.reply_segments`）。
+- `tts_speaker = "xiaoai"` 时用小爱原生 TTS 流水线：后面的段用 `mibrain text_to_speech save=1` 提前生成，再依次 `miplayer` 播放，段间几乎不停顿；其他 TTS 按段依次合成播放。
+- 只读 `delta.content`，模型的 `reasoning_content` 不读；朗读前去掉 Markdown 符号、链接、表情和 `<think>` 块。
+- 接 Hermes 时会收到 `hermes.tool.progress` 事件：开始调用工具、还没有正文时先念一句"稍等"（搜索类工具念"我查一下"），见 `openai.tool_filler`。
+- 回采在线时，从发出请求到播完都可以用唤醒词打断。
+- 服务端不支持流式时会自动按普通 JSON 回复处理；设 `"stream": False` 回到等整段回复再播。
+
 ## 🐾 QwenPaw 集成
 
 用于接入阿里的 [QwenPaw](https://github.com/agentscope-ai/QwenPaw)。桥接器会调用 QwenPaw 的 HTTP Console 后台任务接口，将小爱音箱识别到的文本发送给指定 Agent，并把回复通过小爱或豆包 TTS 播放出来。
@@ -886,11 +897,10 @@ APP_CONFIG = {
 
 ## 🎼 小爱管家（你好缪斯）
 
-本 fork 新增的唤醒词：说 **"你好缪斯"**，进入 OpenAI 兼容服务（本机部署为 Hermes Agent，模型 `muse-home`）的连续对话，
-和"召唤小黑"走的是同一条 `"openai"` 链路。**"小爱同学"原生链路不受影响**。
+本 fork 新增的唤醒词：说 **"你好缪斯"**，进入 OpenAI 兼容服务（当前部署连接云端 Hermes Agent，模型 `muse-home`）的连续对话，路由为 `"openai"`。**"小爱同学"原生链路不受影响**。
 
 需要同时设置 `MUSE_ENABLE=1`（启用缪斯唤醒词，会同时启用 KWS 关键词生成和 VAD/KWS）和 `OPENAI_ENABLE=1`（启用对话后端，见 [OpenAI 兼容服务](#-openai-兼容服务)）。
-Hermes 需要主动播报时调用本机 `POST /api/play/text`。
+主动提醒计划直接使用 Oracle 上现有的米家云端播报接口，不要求本机 bridge 在线；工具和定时任务的接入验收见[迁移计划阶段 6](docs/ownding-migration-plan.md#61-主动播报直接使用米家云端接口)。本机 `POST /api/play/text` 仍可供本地应用使用。
 
 ### 触发方式
 
@@ -901,11 +911,13 @@ Hermes 需要主动播报时调用本机 `POST /api/play/text`。
 | "小爱同学" → "你好缪斯，我今晚想洗澡" / "缪斯" | `xiaoai` | 拦截原生小爱回复（`muse.native_suppress`），进入连续对话 |
 | "小爱同学，开灯" / "我喜欢缪斯" / "museum 门票多少钱" | `xiaoai` | 原生小爱处理 |
 
-> 目前进入连续对话后会重新听一句，唤醒词后面同一句里的内容（上例的"我今晚想洗澡"）不会带过去。
+> 本地 KWS 唤醒会按音频位置补录同一句中唤醒词后的内容；原生小爱 ASR 的文本入口仍会进入对话后重新监听一句。
 
 **播报中打断**（`APP_CONFIG["barge_in"]`，需要 OwnDing 版音箱客户端，只在 OH2P 上验证过）：音箱同时发回播放回采，bridge 消除回声后播报时也开着麦克风。
 对话中回答还没说完时喊"你好缪斯"，会立即停下并直接听下一句；"你好缪斯，明天天气怎么样"一口气说完，后半句也会带进去。回采不在线时自动退回"播报时关麦"。
-灯效：等你说 9 → 听到你在说 41 → 思考 2 → 播报（可打断）3，见 `core/services/conversation_light.py`。
+灯效和原生小爱一致：提示音 / 回答时是播报灯 3（随播放声音起伏）→ 等你说是短白灯 41 → 你说话时白光随你的音量变宽 → 思考 2 → 播报 3，见 `core/services/conversation_light.py`。白光随音量需要音箱能连到 bridge 的 4400 端口（`conversation.light_level`，见 `core/services/light_level.py`）；连不上时退回静止白光。
+
+唤醒和播报中被打断时，会随机说一句应答语（"我在"/"在"/"哎"…），可在 `conversation.wake_reply` 里改词或关闭；小爱原生 TTS 时用小爱自己的声音，第一次生成后缓存在音箱上。连续 `wakeup.timeout`（默认 20）秒没开口会自动退出。
 
 ### 唤醒词
 
