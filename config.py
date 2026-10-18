@@ -205,6 +205,25 @@ APP_CONFIG = {
         "keywords_score": 2.0,
         # 唤醒词检测阈值（越低越灵敏，越高越难触发）
         "keywords_threshold": 0.2,
+        # 单独调整某个唤醒词的阈值 / 加成（键写法同 wakeup.keywords，没列出的用上面的默认值）。
+        # 嗨缪斯 / 嘿缪斯 第一个字轻、容易被吃掉，阈值放低；hey / hello muse 会把 "museum" / "amuse" 认成它，阈值提高。
+        "keyword_thresholds": {
+            "嗨缪斯": 0.02,
+            "嘿缪斯": 0.02,
+            "hi muse": 0.1,
+            "hey muse": 0.25,
+            "hello muse": 0.35,
+        },
+        "keyword_scores": {},
+        # 解码时保留的候选数：越大越不容易漏，也越耗 CPU（sherpa 默认 8）
+        "max_active_paths": 16,
+        # 同时跑几路检测，起点各错开多少 ms，任一路认出即唤醒。模型按约 320 ms 一块处理音频，
+        # 唤醒词落在块里的位置会影响能不能认出来；[0] = 只跑一路
+        "stream_offsets_ms": [0, 80, 160, 240],
+        # VAD 判定开口前的这段音频也补进模型（唤醒词开头的字偏轻，VAD 判定时已经说出一小段）
+        "preroll_ms": 300,
+        # True：只在 VAD 判定有人说话时才跑唤醒检测（省 CPU）；False：每帧都跑
+        "vad_gate": True,
         # 唤醒词检测时的最小静默时长（ms），静默超过该时长则判定为说完
         "min_silence_duration": 480,
     },
@@ -472,7 +491,7 @@ APP_CONFIG = {
         #   - 只放"问候语 + 名字"：单独的"缪斯" / "muse" 只有 2 个音节，常驻监听误唤醒风险高，只走 ASR 前缀
         #   - 同音/近音字只走 ASR：KWS 按汉字建模，每多一种写法就多一条常驻误唤醒路径
         #   - 这些词同时也会参与 ASR 前缀匹配；编码失败（模型词表没有的字）的会被跳过并告警
-        "kws_wake_words": ["你好缪斯", "嗨缪斯", "哈喽缪斯", "hi muse", "hey muse", "hello muse"],
+        "kws_wake_words": ["你好缪斯", "嗨缪斯", "哈喽缪斯", "嘿缪斯", "hi muse", "hey muse", "hello muse"],
         "wake_word_aliases": [],  # 追加到 wake_words 的额外写法（兼容旧配置）
         # 唤醒词前可以跳过的语气词（只在句首，可重复）；设为 [] 关闭
         # 不含"那个"：它也是指示代词（"那个缪斯是谁"），去掉会让单独的"缪斯"更容易误触发

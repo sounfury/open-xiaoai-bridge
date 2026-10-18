@@ -118,12 +118,89 @@ def encode_keywords(texts, text2token, **kwargs) -> list[list[str]]:
     return encoded
 
 
-def format_keyword_line(tokens: list[str]) -> str:
-    """纯英文关键词不带 @phrase（KWS 返回拼接的 token，如 "hi▁muse"），其余带 @原文。"""
+def keyword_overrides(config_getter, key: str) -> dict[str, float]:
+    """kws.keyword_thresholds / kws.keyword_scores → {关键词文本: 数值}。
+
+    键按 keywords.txt 里的写法归一化（"Hi Muse" 和 "hi muse" 是同一个），非法值跳过并警告。
+    """
+    raw = config_getter(f"kws.{key}", {}) or {}
+    if not isinstance(raw, dict):
+        logger.warning(f"kws.{key} 应该是 dict，已忽略", module="KWS")
+        return {}
+    result: dict[str, float] = {}
+    for keyword, value in raw.items():
+        if not isinstance(keyword, str):
+            continue
+        try:
+            result[_keyword_text(keyword)] = float(value)
+        except (TypeError, ValueError):
+            logger.warning(f"kws.{key} 里 {keyword!r} 的值 {value!r} 不是数字，已忽略", module="KWS")
+    return result
+
+
+def format_keyword_line(
+    tokens: list[str], threshold: float | None = None, score: float | None = None
+) -> str:
+    """keywords.txt 的一行。
+
+    - 纯英文关键词不带 @phrase（KWS 返回拼接的 token，如 "hi▁muse"），其余带 @原文
+    - score（:x）覆盖这个词的 keywords_score，threshold（#x）覆盖它的 keywords_threshold
+    """
     line = "".join(tokens)
-    if re.match(r"^[▁A-Z\s]+$", line):
-        return " ".join(tokens)
-    return " ".join(tokens) + f" @{line}"
+    parts = [" ".join(tokens)]
+    if score is not None:
+        parts.append(f":{float(score)}")
+    if threshold is not None:
+        parts.append(f"#{float(threshold)}")
+    if not re.match(r"^[▁A-Z\s]+$", line):
+        parts.append(f"@{line}")
+    return " ".join(parts)
+
+
+def build_keyword_lines(texts, encoded_by_text, thresholds=None, scores=None) -> list[str]:
+    """按关键词文本拼出 keywords.txt 的行（编码失败的词不在 encoded_by_text 里，跳过）。"""
+    thresholds = thresholds or {}
+    scores = scores or {}
+    for keyword in sorted((set(thresholds) | set(scores)) - set(texts)):
+        logger.warning(f"kws.keyword_thresholds / keyword_scores 里的 {keyword!r} 不是当前唤醒词，已忽略", module="KWS")
+    return [
+        format_keyword_line(encoded_by_text[text], thresholds.get(text), scores.get(text))
+        for text in texts
+        if text in encoded_by_text
+    ]
+
+
+def generate_keywords_file(output: str, config_getter=None, texts=None) -> int:
+    """编码唤醒词并写入 output；返回写入的行数（0 = 一个都没编码成功）。"""
+    from core.utils.onnx_runtime import prepare_onnxruntime
+
+    prepare_onnxruntime()
+    from sherpa_onnx import text2token
+
+    getter = config_getter or ConfigManager.instance().get_app_config
+    texts = [_keyword_text(t) for t in texts] if texts is not None else get_keyword_texts(getter)
+    kwargs = {
+        "tokens": get_model_file_path("tokens.txt"),
+        "tokens_type": "cjkchar+bpe",
+        "bpe_model": get_model_file_path("bpe.model"),
+    }
+    encoded_by_text: dict[str, list[str]] = {}
+    for text in texts:
+        encoded = encode_keywords([text], text2token, **kwargs)
+        if encoded:
+            encoded_by_text[text] = encoded[0]
+    lines = build_keyword_lines(
+        texts,
+        encoded_by_text,
+        keyword_overrides(getter, "keyword_thresholds"),
+        keyword_overrides(getter, "keyword_scores"),
+    )
+    if not lines:
+        return 0
+    with open(output, "w", encoding="utf8") as f:
+        for line in lines:
+            f.write(line + "\n")
+    return len(lines)
 
 
 def main():
@@ -145,27 +222,13 @@ def main():
         )
         return 1
 
-    from core.utils.onnx_runtime import prepare_onnxruntime
-
-    prepare_onnxruntime()
-    from sherpa_onnx import text2token
-
     args = get_args()
-    encoded_texts = encode_keywords(
-        args["texts"],
-        text2token,
-        tokens=args["tokens"],
-        tokens_type=args["tokens_type"],
-        bpe_model=args["bpe_model"],
-    )
-    if not encoded_texts:
+    written = generate_keywords_file(args["output"], ConfigManager.instance().get_app_config, args["texts"])
+    if not written:
         logger.error("Keyword generation failed: no keyword could be encoded", module="KWS")
         return 1
-    with open(args["output"], "w", encoding="utf8") as f:
-        for txt in encoded_texts:
-            f.write(format_keyword_line(txt) + "\n")
     logger.debug(
-        f"Keyword file generated: {args['output']} ({len(encoded_texts)}/{len(args['texts'])} keywords)",
+        f"Keyword file generated: {args['output']} ({written}/{len(args['texts'])} keywords)",
         module="KWS",
     )
     return 0

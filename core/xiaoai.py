@@ -339,7 +339,47 @@ class XiaoAI:
         if cls._input_gain_enabled and audio_array.size > 0:
             boosted = audio_array.astype(np.float32) * cls._input_gain
             audio_array = np.clip(boosted, -32768, 32767).astype(np.int16)
-        GlobalStream.input(audio_array.tobytes())
+        pcm = audio_array.tobytes()
+        if cls._input_dump is not None:
+            cls._append_input_dump(pcm)
+        GlobalStream.input(pcm)
+
+    @classmethod
+    def _setup_input_dump(cls):
+        """调试 / 唤醒词验收：AUDIO_INPUT_DUMP=<文件.wav> 录下送进 KWS / VAD 的单声道音频
+        （回声消除、增益之后），用 scripts/kws_acceptance.py wav 统计命中率和误唤醒。
+        AUDIO_INPUT_DUMP_SECONDS 控制时长（默认 120 秒），录满后自动保存。"""
+        path = os.environ.get("AUDIO_INPUT_DUMP", "").strip()
+        if not path:
+            return
+        try:
+            seconds = float(os.environ.get("AUDIO_INPUT_DUMP_SECONDS", "120"))
+        except ValueError:
+            seconds = 120.0
+        cls._input_dump = {"path": path, "max_bytes": int(seconds * 16000) * 2, "data": bytearray()}
+        logger.info(f"[XiaoAI] 🎙️ 将录下 {seconds:.0f}s 输入音频到 {path}")
+
+    @classmethod
+    def _append_input_dump(cls, pcm: bytes):
+        dump = cls._input_dump
+        dump["data"].extend(pcm)
+        if len(dump["data"]) < dump["max_bytes"]:
+            return
+        cls._input_dump = None
+        data = bytes(dump["data"][: dump["max_bytes"]])
+
+        def _write():
+            try:
+                with wave.open(dump["path"], "wb") as f:
+                    f.setnchannels(1)
+                    f.setsampwidth(2)
+                    f.setframerate(16000)
+                    f.writeframes(data)
+                logger.info(f"[XiaoAI] 输入音频已保存: {dump['path']}")
+            except Exception as exc:
+                logger.error(f"[XiaoAI] 保存输入音频失败: {exc}")
+
+        threading.Thread(target=_write, daemon=True).start()
 
     @classmethod
     def on_output_data(cls, data: bytes):
@@ -532,6 +572,7 @@ class XiaoAI:
         set_xiaoai(XiaoAI)
         GlobalStream.on_output_data = cls.on_output_data
         cls._setup_echo_reference()
+        cls._setup_input_dump()
         open_xiaoai_server.register_fn("on_input_data", cls.on_input_data)
         open_xiaoai_server.register_fn("on_input_packet", cls.on_input_packet)
         open_xiaoai_server.register_fn("on_event", cls.__on_event)
