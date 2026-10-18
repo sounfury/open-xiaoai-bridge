@@ -1,0 +1,23 @@
+[Unit]
+Description=Mijia heater timeout observer (upstream API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=TZ=Asia/Shanghai
+Environment=MIJIA_LOG_LEVEL=WARNING
+WorkingDirectory=/home/ubuntu/home-tools/mijia/cli-sandbox
+ExecStart=/home/ubuntu/home-tools/mijia/.venv/bin/python policy_watch.py --policy policy.json --state policy-state/state.json --auth /home/ubuntu/.config/mijia-api/auth.json
+Restart=always
+RestartSec=10
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/home-tools/mijia/cli-sandbox/policy-state /home/ubuntu/.config/mijia-api
+PrivateTmp=true
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

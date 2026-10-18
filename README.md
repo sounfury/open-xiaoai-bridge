@@ -900,7 +900,7 @@ APP_CONFIG = {
 本 fork 新增的唤醒词：说 **"你好缪斯"**，进入 OpenAI 兼容服务（当前部署连接云端 Hermes Agent，模型 `muse-home`）的连续对话，路由为 `"openai"`。**"小爱同学"原生链路不受影响**。
 
 需要同时设置 `MUSE_ENABLE=1`（启用缪斯唤醒词，会同时启用 KWS 关键词生成和 VAD/KWS）和 `OPENAI_ENABLE=1`（启用对话后端，见 [OpenAI 兼容服务](#-openai-兼容服务)）。
-主动提醒计划直接使用 Oracle 上现有的米家云端播报接口，不要求本机 bridge 在线；工具和定时任务的接入验收见[迁移计划阶段 6](docs/ownding-migration-plan.md#61-主动播报直接使用米家云端接口)。本机 `POST /api/play/text` 仍可供本地应用使用。
+主动提醒计划直接使用 Oracle 上现有的米家云端播报接口，不要求本机 bridge 在线；工具和定时任务的接入验收见独立的 [Hermes PRD](docs/hermes-prd.md)。本机 `POST /api/play/text` 仍可供本地应用使用。
 
 ### 触发方式
 

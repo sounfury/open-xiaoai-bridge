@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!sshd_config
+!warm_catalog.py
+!entrypoint.sh
+!mijia_house_policy.py
+!mijia_cli.py
