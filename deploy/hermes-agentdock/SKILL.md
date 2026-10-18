@@ -1,32 +1,46 @@
 ---
 name: windows-control
 description: |
-  通过 AgentDock 控制用户的 Windows 电脑（WIN-M2OK7MS7L4J）：音量、静音、媒体播放、启动或关闭程序、
-  锁屏、关屏、睡眠、可取消的关机倒计时。触发词包括"电脑"、"Windows"、"音量"、"静音"、"锁屏"、
-  "关屏"、"睡眠"、"关机"、"打开/关闭某个软件"。
-allowed-tools: mcp agentdock exec_command
+  通过 AgentDock 控制用户的 Windows 电脑（WIN-M2OK7MS7L4J）：音量、静音、媒体播放、启动或关闭
+  Spotify / Steam / 微信 / QQ 等程序、锁屏、关屏、睡眠、可取消的关机倒计时。触发词包括"电脑"、
+  "Windows"、"音量"、"静音"、"锁屏"、"关屏"、"睡眠"、"关机"、"打开/关闭某个软件"。
 ---
 
 ## 调用方式
 
-- 只能使用 AgentDock 的 `exec_command`，参数 `cmd`。命令在用户当前登录的桌面会话中执行，权限为完整管理员。需要 PowerShell 时写 `powershell -NoProfile -Command "..."`。
+- 只能使用 AgentDock 的 `exec_command` 工具，参数 `cmd`。AgentDock 在 Windows 上**直接用 PowerShell 执行** `cmd`，所以下面的命令原样传入即可，不要再套 `powershell -Command`。
+- 命令在用户当前登录的桌面会话中执行，权限为完整管理员。
 - 每次调用前都会经过危险命令规则检查（递归 / 强制删除、格式化、编码命令、强制结束进程等）。被拦截时**不要换写法重试**，直接告诉用户需要他本人在电脑上操作。
-- 不删除、移动、改写用户文件，不安装或卸载软件，不改系统设置、注册表、防火墙和网络。用户的请求超出下面这些常用操作时，先说明要执行什么再做。
+- 不删除、移动、改写用户文件，不安装或卸载软件，不改系统设置、注册表、防火墙和网络。用户的请求超出本 skill 的常用操作时，先说明要执行什么再做。
 - Spotify 的播放、搜索和歌单用官方 Spotify 工具；只有 Spotify 客户端没打开、找不到播放设备时，才用这里启动它。
 
-## 常用操作
+## 常用应用
+
+| 应用 | 启动 | 关闭 | 进程名 |
+|---|---|---|---|
+| Spotify | `Start-Process "$env:APPDATA\Spotify\Spotify.exe"` | `Stop-Process -Name Spotify` | `Spotify` |
+| Steam | `Start-Process 'E:\Steam\steam.exe'` | `Start-Process 'E:\Steam\steam.exe' -ArgumentList '-shutdown'` | `steam` |
+| 微信 | `Start-Process 'E:\application\normal\Weixin\Weixin.exe'` | `Stop-Process -Name Weixin` | `Weixin` |
+| QQ | `Start-Process 'E:\application\normal\qq\QQ.exe'` | `Stop-Process -Name QQ` | `QQ` |
+
+- 查是否在运行：`Get-Process -Name 进程名 -ErrorAction SilentlyContinue`。已在运行时再次启动只会把窗口调出来。
+- Steam 用 `-shutdown` 正常退出，不直接结束进程。关闭微信、QQ 前提醒用户未发送的消息可能丢失。
+- 不在表里的程序：先用 `Get-StartApps | Where-Object Name -match '关键词'` 查找，再用 `Start-Process` 启动；找不到就告诉用户，不要猜路径。
+
+## 系统操作
 
 | 操作 | 命令 |
 |---|---|
-| 音量加 / 减（每次约 2%） | `powershell -NoProfile -Command "$w=New-Object -ComObject WScript.Shell; 1..5 \| % { $w.SendKeys([char]175) }"`（减用 174） |
-| 静音切换 | `powershell -NoProfile -Command "(New-Object -ComObject WScript.Shell).SendKeys([char]173)"` |
-| 播放 / 暂停、下一首、上一首 | 同上，分别用 `[char]179`、`[char]176`、`[char]177` |
-| 启动程序 | `powershell -NoProfile -Command "Start-Process spotify:"`，或 `Start-Process '程序完整路径'` |
-| 关闭程序 | `powershell -NoProfile -Command "Stop-Process -Name 进程名"`（不加 -Force，先确认进程名） |
-| 锁屏 | `rundll32.exe user32.dll,LockWorkStation` |
-| 关屏 | `powershell -NoProfile -Command "(Add-Type '[DllImport(\"user32.dll\")]public static extern int SendMessage(int h,int m,int w,int l);' -Name U -PassThru)::SendMessage(-1,0x0112,0xF170,2)"` |
-| 睡眠 | `rundll32.exe powrprof.dll,SetSuspendState 0,1,0` |
-| 关机倒计时 | `shutdown /s /t 秒数`，用户没说时间默认 60 秒；取消用 `shutdown /a` |
+| 音量加 10% | `$w = New-Object -ComObject WScript.Shell; 1..5 \| ForEach-Object { $w.SendKeys([char]175) }` |
+| 音量减 10% | 同上，`[char]175` 换成 `[char]174` |
+| 静音切换 | `(New-Object -ComObject WScript.Shell).SendKeys([char]173)` |
+| 播放 / 暂停 | `(New-Object -ComObject WScript.Shell).SendKeys([char]179)` |
+| 下一首 / 上一首 | 同上，分别用 `[char]176`、`[char]177` |
+| 锁屏 | `rundll32.exe 'user32.dll,LockWorkStation'` |
+| 关屏 | `Add-Type -Name U -Namespace W -MemberDefinition '[DllImport("user32.dll")] public static extern bool PostMessage(int h, int m, int w, int l);'; [void][W.U]::PostMessage(0xFFFF, 0x0112, 0xF170, 2)` |
+| 睡眠 | `Add-Type -AssemblyName System.Windows.Forms; [void][System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)` |
+| 关机倒计时 | `shutdown.exe /s /t 秒数`；取消用 `shutdown.exe /a` |
 
-- 关机、重启、睡眠前告诉用户将要执行的动作和倒计时；关机必须使用倒计时，不立即关机。
-- 程序路径不确定时，先用 `Get-Command`、`Get-StartApps` 或开始菜单快捷方式查找，不要猜。
+- 音量键每按一下约 2%，命令里的 `1..5` 表示按 5 下。用户说"大一点 / 小一点"默认 10%；说"调大很多"可以按 10 下（约 20%）；要求具体百分比时按"目标差值 ÷ 2"换算次数，并说明是估算。
+- 这台电脑没有启用休眠，睡眠命令进入的就是睡眠（现代待机）。
+- 关机、重启、睡眠前告诉用户将要执行的动作和倒计时。关机必须用倒计时，用户没说时间默认 60 秒，不立即关机。
