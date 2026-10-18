@@ -216,6 +216,18 @@ APP_CONFIG = {
         # 最小静默时长（ms）
         "min_silence_duration": 500,
     },
+    # 外部后端（OpenAI / OpenClaw / QwenPaw）连续对话的轮次衔接
+    "conversation": {
+        # 唤醒后 / 每轮回答播完后播提示音。有回采时提示音不耽误听：这期间说的话会回放给 VAD
+        "start_sound": True,
+        "next_turn_sound": True,
+        # 回答播完后跳过这么长再开始听（避开播报的最后一点余音），ms
+        "tts_end_guard_ms": 150,
+        # 唤醒词认出时已经过去一小段，从认出的位置往回这么多开始听（"你好缪斯，开灯"），ms
+        "keyword_tail_ms": 100,
+        # 没有回采、重新开麦后丢掉开头这么长（可能带着提示音余音），ms
+        "mic_start_skip_ms": 150,
+    },
     "audio_input": {
         # 进入 VAD/KWS/ASR 前放大麦克风输入，1.0 = 不放大。
         # OwnDing 客户端（S32 >> 8）比旧客户端（S16，相当于 >> 16）响 256 倍，说话时已接近满幅，不要再放大；
@@ -342,7 +354,9 @@ APP_CONFIG = {
         # },
         "agent_tts_speakers": {},
         "response_timeout": 120,  # 等待 OpenClaw agent 响应的超时时间（秒）
-        "exit_keywords": ["退出", "停止", "再见"],  # 退出连续对话的关键词
+        # 退出连续对话的词（规则见 core/exit_words.py）：只说退出词（可带"好的""谢谢"或唤醒词）马上退出；
+        # "关灯，拜拜"先回答再退出；"停止播放音乐""用英语怎么说再见"照常发给后端。设成 [] 关闭
+        "exit_keywords": ["拜拜", "再见", "退出", "退下", "停止", "没事了", "不用了", "结束对话", "bye", "goodbye"],
         # rule_prompt: 用于「自动播放」和「连续对话」场景
         #   - send_to_openclaw_and_play_reply() 会自动追加
         #   - OpenClawConversationController 会自动追加
@@ -386,7 +400,7 @@ APP_CONFIG = {
         "tts_speed": 1.0,
         "tts_speaker": "xiaoai",
         "session_tts_speakers": {},
-        "exit_keywords": ["退出", "停止", "再见"],
+        "exit_keywords": ["拜拜", "再见", "退出", "退下", "停止", "没事了", "不用了", "结束对话", "bye", "goodbye"],
         "rule_prompt": "注意：将结果处理成纯文字版，不要返回任何 markdown 格式，也不要包含任何代码块，并将字数控制在300字以内",
         "rule_prompt_for_skill": "注意：这条消息是主人通过小爱音箱发送的，他看不到你回复的文字。字数控制在300字以内",
         "extra_body": {},
@@ -423,7 +437,7 @@ APP_CONFIG = {
         "tts_speed": 1.0,
         "tts_speaker": "xiaoai",
         "session_tts_speakers": {},
-        "exit_keywords": ["退出", "停止", "再见"],
+        "exit_keywords": ["拜拜", "再见", "退出", "退下", "停止", "没事了", "不用了", "结束对话", "bye", "goodbye"],
         "rule_prompt": "注意：将结果处理成纯文字版，不要返回任何 markdown 格式，也不要包含任何代码块，并将字数控制在300字以内",
         "rule_prompt_for_skill": "注意：这条消息是主人通过小爱音箱发送给 QwenPaw 的，他看不到你回复的文字。字数控制在300字以内",
     },

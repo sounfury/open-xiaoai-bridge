@@ -16,6 +16,11 @@ Key design decisions:
     speaker's echo reference live (barge_in.enabled), the microphone stays on
     while speaking, KWS keeps listening, and a wake word stops the reply and
     starts the next turn right away (speech after the wake word is kept).
+  - With the echo reference live, every turn listens from a position in the
+    GlobalStream history (replay): speech right after the wake word or right
+    after the reply ends is not lost, even while the ready sound is playing.
+  - Exit words follow core/exit_words.py: "拜拜" exits now, "关灯，拜拜" is
+    answered first and then exits.
   - Lights are state-driven (core/services/conversation_light.py) and never
     block the voice flow.
 """
@@ -25,7 +30,9 @@ import os
 
 import open_xiaoai_server
 
+from core.exit_words import AFTER_ANSWER, DEFAULT_EXIT_WORDS, NOW, match_exit_intent
 from core.ref import get_kws, get_speaker, get_vad, get_xiaoai
+from core.services.audio.stream import GlobalStream
 from core.services.conversation_light import ConversationLight, effects_from_config
 from core.utils.config import ConfigManager
 
@@ -93,13 +100,16 @@ class ExternalConversationController:
         # Playback token for the current TTS session
         self._playback_token: int | None = None
         self._light: ConversationLight | None = None
-        # 打断后下一轮从 GlobalStream 的这个位置开始补录（唤醒词之后已经说出的话）
-        self._barge_in_from: int | None = None
+        # 下一轮从 GlobalStream 历史的哪里开始听：(preroll_from, replay_from)，见 VAD.resume
+        self._next_listen: tuple[int | None, int | None] | None = None
+        # 下一轮是接着唤醒词听的（识别结果开头可能带着唤醒词，要去掉）
+        self._next_after_keyword = False
         self._background_tasks: set[asyncio.Task] = set()
 
     @property
     def exit_keywords(self) -> list[str]:
-        return self._cfg("exit_keywords", ["退出", "停止", "再见"])
+        words = self._cfg("exit_keywords", None)
+        return list(DEFAULT_EXIT_WORDS) if words is None else list(words)
 
     @property
     def timeout(self) -> int:
@@ -127,14 +137,20 @@ class ExternalConversationController:
     def is_active(self) -> bool:
         return self.active
 
-    async def start(self):
-        """Enter OpenClaw conversation mode."""
+    async def start(self, wake_position: int | None = None):
+        """Enter conversation mode.
+
+        wake_position: KWS 命中时唤醒词结束的 GlobalStream 位置；回采在线时第一轮从这里接着听，
+        "你好缪斯，开灯"一口气说完，"开灯"不会丢。
+        """
         if self.active:
             logger.warning(f"[{self.LOG_MODULE}] Already active, ignoring start()")
             return
         self.active = True
         self._loop = asyncio.get_running_loop()
-        self._barge_in_from = None
+        self._next_listen = None
+        self._next_after_keyword = False
+        self._wake_position = wake_position
         self._light = ConversationLight(
             get_speaker(),
             effects_from_config(
@@ -244,6 +260,44 @@ class ExternalConversationController:
     def _barge_cfg(self, key: str, default=None):
         return self.config.get_app_config(f"barge_in.{key}", default)
 
+    def _conv_cfg(self, key: str, default=None):
+        """所有外部后端共用的轮次衔接配置（APP_CONFIG["conversation"]）。"""
+        return self.config.get_app_config(f"conversation.{key}", default)
+
+    @staticmethod
+    def _ms_to_samples(ms) -> int:
+        try:
+            return max(0, int(float(ms) * 16))
+        except (TypeError, ValueError):
+            return 0
+
+    def _listen_after_keyword(self, position: int):
+        """唤醒词在 position 附近结束：从它前面 keyword_tail_ms 开始重新检测说话，
+        再往前 speech_lookback_ms 的音频只作为开头补给识别。"""
+        self._next_after_keyword = True
+        tail = self._ms_to_samples(self._conv_cfg("keyword_tail_ms", 100))
+        lookback = self._ms_to_samples(self._barge_cfg("speech_lookback_ms", 350))
+        position = int(position)
+        self._next_listen = (max(0, position - max(lookback, tail)), max(0, position - tail))
+
+    def _wake_names(self) -> list[str]:
+        """当前的唤醒词（退出词判断时忽略句首的唤醒词）。"""
+        names = [k for k in (self.config.get_app_config("wakeup.keywords", []) or []) if isinstance(k, str)]
+        try:
+            from core.muse import load_settings
+
+            names += load_settings().wake_words
+        except Exception:
+            pass
+        return names
+
+    def _exit_intent(self, text: str) -> tuple[str | None, str | None]:
+        try:
+            return match_exit_intent(text, self.exit_keywords, self._wake_names())
+        except Exception as exc:
+            logger.warning(f"Exit word check failed: {type(exc).__name__}: {exc}", module=self.LOG_MODULE)
+            return None, None
+
     def _barge_in_ready(self) -> bool:
         """打断已开启，且音箱正在发送回采（回声能消掉）。"""
         if not self._barge_cfg("enabled", False):
@@ -272,15 +326,22 @@ class ExternalConversationController:
         """Run VAD -> ASR -> backend -> TTS turns until exit."""
 
         # 没有回采时：关麦 → 提示音 → 开麦，避免录到 before_wakeup 的播报和提示音。
-        # 有回采时麦克风一直开着，回声由回声消除去掉。
+        # 有回采时麦克风一直开着，回声由回声消除去掉；第一轮从唤醒词后面接着听，
+        # 提示音期间说的话也会回放给 VAD。
         # VAD.resume() resets all state (speech_frames, input_bytes),
         # so speech detection starts clean when listening begins.
+        start_sound = bool(self._conv_cfg("start_sound", True))
         if self._barge_in_ready():
-            await self._play_notify()
+            if self._wake_position is not None and not self.uses_xiaoai_asr():
+                self._listen_after_keyword(self._wake_position)
+            if start_sound:
+                await self._play_notify()
         else:
             await self._stop_recording()
-            await self._play_notify()
+            if start_sound:
+                await self._play_notify()
             await self._start_recording()
+            await self._skip_mic_start()
         logger.debug("Ready to listen", module=self.LOG_MODULE)
 
         while self.active:
@@ -293,6 +354,12 @@ class ExternalConversationController:
                     await self._stop_xiaoai_native_listening()
                 await self._call_after_wakeup()
                 break
+            elif result == "exit_after_answer":
+                # 回答里已经道别了，不再播 after_wakeup 的告别语
+                if self.uses_xiaoai_asr():
+                    await self._stop_xiaoai_native_listening()
+                logger.info("👋 回答完了，退出对话", module=self.LOG_MODULE)
+                break
             elif result in ("error", "interrupted"):
                 # 被 stop() 打断时静默退出，不播告别语、不再操作小爱监听
                 break
@@ -303,6 +370,7 @@ class ExternalConversationController:
         Returns:
             "continue" - turn completed, loop to next
             "exit"     - user said an exit keyword
+            "exit_after_answer" - answered a request that ended with a goodbye
             "timeout"  - no speech detected within timeout
             "interrupted" - stop() was called before listening started
             "error"    - unrecoverable error
@@ -316,8 +384,12 @@ class ExternalConversationController:
         self._light_state("listening")
         if not self.active:
             return "interrupted"
-        barge_in_from, self._barge_in_from = self._barge_in_from, None
-        speech_bytes = await self._wait_for_speech(vad, preroll_from=barge_in_from)
+        listen, self._next_listen = self._next_listen, None
+        after_keyword, self._next_after_keyword = self._next_after_keyword, False
+        preroll_from, replay_from = listen or (None, None)
+        speech_bytes = await self._wait_for_speech(
+            vad, preroll_from=preroll_from, replay_from=replay_from
+        )
         if speech_bytes is None:
             return "timeout"
 
@@ -331,18 +403,20 @@ class ExternalConversationController:
         from core.services.audio.asr import ASRService
 
         text = ASRService.asr(speech_bytes, sample_rate=16000)
-        if barge_in_from is not None:
-            # 补录的开头带着唤醒词（"你好缪斯，明天天气怎么样"），去掉
+        if after_keyword:
+            # 接着唤醒词听的，开头可能带着唤醒词或它的尾音（"你好缪斯，明天天气怎么样"），去掉
             text = self._strip_wake_word(text)
         if not text or not any(character.isalnum() for character in text):
             logger.debug("ASR empty, retrying", module=self.LOG_MODULE)
             return "continue"
 
-        # 3. Check exit keywords
-        for kw in self.exit_keywords:
-            if kw in text:
-                logger.info(f"Exit keyword: {kw}", module=self.LOG_MODULE)
-                return "exit"
+        # 3. Check exit words
+        intent, word = self._exit_intent(text)
+        if intent == NOW:
+            logger.info(f"Exit word: {word} ({text})", module=self.LOG_MODULE)
+            return "exit"
+        if intent == AFTER_ANSWER:
+            logger.info(f"Exit after answer: {word} ({text})", module=self.LOG_MODULE)
 
         # 4. Send to backend and wait for response
         full_text = text
@@ -356,12 +430,12 @@ class ExternalConversationController:
         response = await self.backend._wait_response(run_id) if run_id else None
         if response is None:
             logger.warning(f"No response from {self.BACKEND_NAME}", module=self.LOG_MODULE)
-            await self._play_reply_and_resume(
-                self._cfg("failure_text", "我听到了，但 AI 服务暂时没有返回回答，请稍后再试"), vad
-            )
-            return "continue"
+            response = self._cfg("failure_text", "我听到了，但 AI 服务暂时没有返回回答，请稍后再试")
 
-        await self._play_reply_and_resume(str(response), vad)
+        exit_after = intent == AFTER_ANSWER
+        interrupted = await self._play_reply_and_resume(str(response), vad, exit_after=exit_after)
+        if exit_after and not interrupted:
+            return "exit_after_answer"
         return "continue"
 
     async def _run_one_turn_with_xiaoai_asr(self) -> str:
@@ -371,10 +445,12 @@ class ExternalConversationController:
             logger.debug("XiaoAI native ASR turn timed out", module=self.LOG_MODULE)
             return "timeout"
 
-        for kw in self.exit_keywords:
-            if kw in text:
-                logger.info(f"Exit keyword: {kw}", module=self.LOG_MODULE)
-                return "exit"
+        intent, word = self._exit_intent(text)
+        if intent == NOW:
+            logger.info(f"Exit word: {word} ({text})", module=self.LOG_MODULE)
+            return "exit"
+        if intent == AFTER_ANSWER:
+            logger.info(f"Exit after answer: {word} ({text})", module=self.LOG_MODULE)
 
         self._light_state("thinking")
         full_text = text
@@ -383,17 +459,21 @@ class ExternalConversationController:
         response = await self.backend.send(full_text, wait_response=True)
         if response is None:
             logger.warning(f"No response from {self.BACKEND_NAME}", module=self.LOG_MODULE)
-            await self._play_reply_and_resume(
-                self._cfg("failure_text", "我听到了，但 AI 服务暂时没有返回回答，请稍后再试")
-            )
-            return "continue"
+            response = self._cfg("failure_text", "我听到了，但 AI 服务暂时没有返回回答，请稍后再试")
 
-        await self._play_reply_and_resume(str(response))
+        exit_after = intent == AFTER_ANSWER
+        interrupted = await self._play_reply_and_resume(str(response), exit_after=exit_after)
+        if exit_after and not interrupted:
+            return "exit_after_answer"
         return "continue"
 
-    @staticmethod
-    def _strip_wake_word(text: str) -> str:
-        """去掉句首的缪斯唤醒词；不含唤醒词时原样返回。"""
+    def _strip_wake_word(self, text: str) -> str:
+        """去掉句首的唤醒词（或唤醒词的尾音）；不含时原样返回。
+
+        - "你好缪斯，明天天气怎么样" / "缪斯开灯" → 按缪斯唤醒词规则去掉
+        - "好缪斯，开灯" → 去掉唤醒词的后半截（两个字以上）
+        - "斯，开灯" → 只剩一个字的尾音，后面紧跟标点时才去掉（"思考一下"不动）
+        """
         if not text:
             return text
         try:
@@ -401,12 +481,18 @@ class ExternalConversationController:
 
             match = match_settings_text(text, load_settings())
         except Exception:
-            return text
-        return match.content if match else text
+            match = None
+        if match:
+            return match.content
+        from core.muse import strip_wake_word_tail
+
+        return strip_wake_word_tail(text, self._wake_names())
 
     # ---- VAD integration ----
 
-    async def _wait_for_speech(self, vad, preroll_from: int | None = None) -> bytes | None:
+    async def _wait_for_speech(
+        self, vad, preroll_from: int | None = None, replay_from: int | None = None
+    ) -> bytes | None:
         """Use VAD to detect speech and collect complete utterance.
 
         Follows the same two-step pattern as the XiaoZhi wakeup session:
@@ -415,6 +501,9 @@ class ExternalConversationController:
 
         The audio stream is tapped between step 1 and 2 to capture the
         full utterance that the VAD does not provide by itself.
+
+        preroll_from / replay_from: see VAD.resume (listen from a position in
+        the GlobalStream history, so speech that already started is kept).
 
         Returns:
             PCM bytes of captured speech, or None on timeout.
@@ -468,10 +557,13 @@ class ExternalConversationController:
         vad._handle_silence_frame = _recording_silence_frame
 
         try:
-            if preroll_from is None:
+            if replay_from is not None and replay_from > GlobalStream.samples:
+                # 播完后的保护段还没过完：等它过完再开始
+                await asyncio.sleep(min(1.0, (replay_from - GlobalStream.samples) / 16000))
+            if preroll_from is None and replay_from is None:
                 vad.resume("speech")
             else:
-                vad.resume("speech", preroll_from=preroll_from)
+                vad.resume("speech", preroll_from=preroll_from, replay_from=replay_from)
             result = await asyncio.wait_for(self._vad_future, timeout=self.timeout)
             return result
 
@@ -560,37 +652,6 @@ class ExternalConversationController:
                 module=self.LOG_MODULE,
             )
 
-    async def _wait_for_silence(self, vad):
-        """Wait until the environment is silent before starting to listen.
-
-        Uses VAD silence detection to confirm the speaker has stopped playing.
-        If speech is detected (e.g. TTS tail), keeps retrying silence detection.
-        """
-        from core.wakeup_session import EventManager
-
-        future = self._loop.create_future()
-        original_on_silence = EventManager.on_silence
-        original_on_speech = EventManager.on_speech
-
-        def _on_silence():
-            if not future.done():
-                self._loop.call_soon_threadsafe(future.set_result, True)
-
-        def _on_speech(_speech_buffer: bytes):
-            # Still hearing sound — switch back to silence detection
-            vad.resume("silence")
-
-        EventManager.on_silence = _on_silence
-        EventManager.on_speech = _on_speech
-        try:
-            vad.resume("silence")
-            await asyncio.wait_for(future, timeout=1)
-        except asyncio.TimeoutError:
-            vad.pause()
-        finally:
-            EventManager.on_speech = original_on_speech
-            EventManager.on_silence = original_on_silence
-
     # ---- Recording control (physical mute/unmute via remote arecord) ----
 
     async def _stop_recording(self):
@@ -611,13 +672,24 @@ class ExternalConversationController:
         except Exception as exc:
             logger.debug(f"start_recording error: {exc}", module=self.LOG_MODULE)
 
+    async def _skip_mic_start(self):
+        """没有回采、刚重新开麦时丢掉开头一小段（可能带着提示音 / 播报的余音）。"""
+        try:
+            skip_s = max(0.0, float(self._conv_cfg("mic_start_skip_ms", 150)) / 1000)
+        except (TypeError, ValueError):
+            skip_s = 0.0
+        if skip_s:
+            await asyncio.sleep(skip_s)
+
     # ---- TTS ----
 
-    async def _play_reply_and_resume(self, text: str, vad=None):
-        """播报回答，结束后恢复下一轮监听。
+    async def _play_reply_and_resume(self, text: str, vad=None, exit_after: bool = False) -> bool:
+        """播报回答，结束后准备下一轮监听；被唤醒词打断返回 True。
 
         回采在线时不关麦，播报中喊唤醒词可以打断：直接进入下一轮，不播提示音。
-        否则关麦播报，播完放提示音再开麦。
+        播完后下一轮从"播完 + tts_end_guard_ms"开始回放，用户一接话就能听到。
+        没有回采时关麦播报，播完（可选）放提示音再开麦，丢掉开麦后的一小段。
+        exit_after：这是最后一轮（"关灯，拜拜"），播完不再准备下一轮。
         """
         barge_in = self._barge_in_ready()
         interrupted = False
@@ -630,16 +702,25 @@ class ExternalConversationController:
             else:
                 await self._play_tts(text)
         finally:
-            if self.active and not interrupted:
+            if self.active and not interrupted and not exit_after:
                 self._light_state("listening")
-                await self._play_notify()
-                if not barge_in:
+                next_sound = bool(self._conv_cfg("next_turn_sound", True))
+                if barge_in:
+                    guard = self._ms_to_samples(self._conv_cfg("tts_end_guard_ms", 150))
+                    self._next_listen = (None, GlobalStream.samples + guard)
+                    if next_sound:
+                        await self._play_notify()
+                else:
+                    if next_sound:
+                        await self._play_notify()
                     await self._start_recording()
-        if interrupted or not self.active:
-            return
-        if vad is not None:
-            await self._wait_for_silence(vad)
-        logger.debug("Ready for next conversation round", module=self.LOG_MODULE)
+                    await self._skip_mic_start()
+            elif not barge_in:
+                # 最后一轮 / 已停止：麦克风交还给 KWS
+                await self._start_recording()
+        if not interrupted and self.active and not exit_after:
+            logger.debug("Ready for next conversation round", module=self.LOG_MODULE)
+        return interrupted
 
     async def _play_tts_interruptible(self, text: str) -> bool:
         """边播报边检测唤醒词；被打断返回 True。"""
@@ -673,8 +754,7 @@ class ExternalConversationController:
         speaker = get_speaker()
         if speaker:
             self._background(speaker.stop_device_audio())
-        lookback = int(self._barge_cfg("speech_lookback_ms", 350)) * 16
-        self._barge_in_from = max(0, int(position) - lookback)
+        self._listen_after_keyword(position)
         logger.info(f"✋ 打断播报: {keyword}", module=self.LOG_MODULE)
         return True
 

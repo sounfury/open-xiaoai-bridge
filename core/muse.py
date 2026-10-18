@@ -345,6 +345,34 @@ def parse_muse_text(
     return MuseMatch(wake_word=word, content=content)
 
 
+def strip_wake_word_tail(text: str, wake_words) -> str:
+    """去掉句首唤醒词的后半截："好缪斯，开灯" → "开灯"；"斯，开灯" → "开灯"。
+
+    一个字的尾音只有后面紧跟标点 / 空格时才去掉，免得把"思考一下"的"思"当成尾音。
+    """
+    def is_sep(ch: str) -> bool:
+        return ch.isspace() or unicodedata.category(ch)[0] in ("P", "Z")
+
+    stripped = text.lstrip()
+    suffixes: set[str] = set()
+    for word in wake_words or ():
+        if not isinstance(word, str):
+            continue
+        compact = "".join(ch for ch in word if not is_sep(ch))
+        suffixes.update(compact[i:] for i in range(1, len(compact)))
+    for suffix in sorted(suffixes, key=len, reverse=True):
+        if not stripped.lower().startswith(suffix.lower()):
+            continue
+        rest = stripped[len(suffix):]
+        if len(suffix) == 1 and not (rest[:1] and is_sep(rest[0])):
+            continue
+        i = 0
+        while i < len(rest) and is_sep(rest[i]):
+            i += 1
+        return rest[i:]
+    return text
+
+
 def match_settings_text(text: str, settings: MuseSettings) -> MuseMatch | None:
     """按配置匹配（不检查 MUSE_ENABLE）。"""
     return parse_muse_text(text, settings.wake_words, settings.match_mode, settings.leading_fillers)

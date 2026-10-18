@@ -128,7 +128,9 @@ class WakeupSessionManager:
                 )
         return False
 
-    async def wakeup(self, text, source):
+    async def wakeup(self, text, source, position: int | None = None):
+        """position：KWS 命中时唤醒词结束的 GlobalStream 绝对采样位置，
+        外部后端对话从这里接着听（"你好缪斯，开灯"里的"开灯"不丢）。"""
         before_wakeup = self.config.get_app_config("wakeup.before_wakeup")
         kws = get_kws()
         logger.debug(f"[Wakeup] Received wakeup request from {source}: {text}")
@@ -166,15 +168,15 @@ class WakeupSessionManager:
             await self.reset_all_sessions()
 
         if should_wakeup == "openclaw":
-            await self._start_openclaw_conversation()
+            await self._start_openclaw_conversation(position)
         elif should_wakeup == "openai":
-            await self._start_openai_conversation()
+            await self._start_openai_conversation(position)
         elif should_wakeup == "qwenpaw":
-            await self._start_qwenpaw_conversation()
+            await self._start_qwenpaw_conversation(position)
         elif should_wakeup == "xiaozhi":
             self.on_wakeup()
 
-    async def _start_openclaw_conversation(self):
+    async def _start_openclaw_conversation(self, wake_position: int | None = None):
         """Start an OpenClaw continuous conversation session.
 
         This runs independently of the XiaoZhi session state machine.
@@ -187,7 +189,9 @@ class WakeupSessionManager:
             kws.pause()
         try:
             self._openclaw_controller = OpenClawConversationController()
-            self._openclaw_task = asyncio.create_task(self._openclaw_controller.start())
+            self._openclaw_task = asyncio.create_task(
+                self._openclaw_controller.start(wake_position=wake_position)
+            )
             await self._openclaw_task
         except asyncio.CancelledError:
             pass  # interrupted cleanly by on_interrupt
@@ -202,7 +206,7 @@ class WakeupSessionManager:
             if kws:
                 kws.resume()
 
-    async def _start_openai_conversation(self):
+    async def _start_openai_conversation(self, wake_position: int | None = None):
         """Start an OpenAI-compatible continuous conversation session."""
         from core.openai_conversation import OpenAIConversationController
 
@@ -211,7 +215,9 @@ class WakeupSessionManager:
             kws.pause()
         try:
             self._openai_controller = OpenAIConversationController()
-            self._openai_task = asyncio.create_task(self._openai_controller.start())
+            self._openai_task = asyncio.create_task(
+                self._openai_controller.start(wake_position=wake_position)
+            )
             await self._openai_task
         except asyncio.CancelledError:
             pass
@@ -226,7 +232,7 @@ class WakeupSessionManager:
             if kws:
                 kws.resume()
 
-    async def _start_qwenpaw_conversation(self):
+    async def _start_qwenpaw_conversation(self, wake_position: int | None = None):
         """Start a QwenPaw continuous conversation session."""
         from core.qwenpaw_conversation import QwenPawConversationController
 
@@ -235,7 +241,9 @@ class WakeupSessionManager:
             kws.pause()
         try:
             self._qwenpaw_controller = QwenPawConversationController()
-            self._qwenpaw_task = asyncio.create_task(self._qwenpaw_controller.start())
+            self._qwenpaw_task = asyncio.create_task(
+                self._qwenpaw_controller.start(wake_position=wake_position)
+            )
             await self._qwenpaw_task
         except asyncio.CancelledError:
             pass
