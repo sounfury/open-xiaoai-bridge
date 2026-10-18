@@ -4,8 +4,8 @@ import subprocess
 import time
 from pathlib import Path
 
-workspace = Path.home() / "workspace"
-workspace.mkdir(exist_ok=True)
+workspace = Path('/opt/data/workspace/mijia')
+workspace.mkdir(parents=True, exist_ok=True)
 result = subprocess.run(["mijiaAPI", "-l", "--list_homes", "--list_scenes"],
                         capture_output=True, text=True, timeout=120)
 if result.returncode or "设备列表:" not in result.stdout or "家庭列表:" not in result.stdout:

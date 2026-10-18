@@ -4,7 +4,7 @@ import json
 import sys
 from pathlib import Path
 
-POLICY_PATH = Path('/etc/mijia/house-policy.json')
+POLICY_PATH = Path(__file__).with_name('house-policy.json')
 
 
 def has_blocked_did(value, blocked: set[str]) -> bool:
