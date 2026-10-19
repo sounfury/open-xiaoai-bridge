@@ -134,7 +134,25 @@ class XiaoAI:
         return False
 
     @classmethod
-    async def _suppress_dialog(cls, dialog_id: str, reason: str):
+    async def _stop_native_playback(cls, dialog_id: str):
+        """停掉小爱拿走识别结果后自己的回答。
+
+        云端 Speak 比最终识别结果晚约 150ms，并且走 mediaplayer，
+        不是 tts_play.sh / miplayer。只杀后者会让“没找到歌单”继续播出。
+        """
+        if not dialog_id or not all(c in "0123456789abcdefABCDEF" for c in dialog_id):
+            return
+        command = (
+            "killall tts_play.sh miplayer 2>/dev/null; "
+            "ubus -t 1 call mediaplayer player_play_operation "
+            "'{\"action\":\"stop\",\"media\":\"common\",\"dialog_id\":\"%s\"}'; "
+            "mphelper pause; "
+            "rm -f /tmp/tts/tts_%s_*.mp3"
+        ) % (dialog_id, dialog_id)
+        await cls.speaker.run_shell(command)
+
+    @classmethod
+    async def _suppress_dialog(cls, dialog_id: str, reason: str, *, force: bool = False):
         if not dialog_id:
             return
 
@@ -157,16 +175,23 @@ class XiaoAI:
 
         now = time.monotonic()
         last_attempt = cls._suppressed_dialog_last_attempt.get(dialog_id, 0.0)
-        if not is_new_dialog and (now - last_attempt) < cls._SUPPRESS_RETRY_INTERVAL:
+        # 普通 NLP 事件会连续刷屏；Speak / 播放指令不能被这个间隔吞掉，
+        # 否则第一次停播发生在音频尚未创建时，随后的 Speak 就会播完。
+        if not force and not is_new_dialog and (now - last_attempt) < cls._SUPPRESS_RETRY_INTERVAL:
             return
 
         cls._suppressed_dialog_last_attempt[dialog_id] = now
         try:
-            await cls.speaker.run_shell(
-                "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
-            )
-            if is_new_dialog:
-                await cls.speaker.wake_up(awake=False)
+            await cls._stop_native_playback(dialog_id)
+            if force or is_new_dialog:
+                loop = asyncio.get_running_loop()
+
+                async def retry():
+                    await asyncio.sleep(0.45)
+                    if dialog_id in cls._suppressed_dialog_ids:
+                        await cls._stop_native_playback(dialog_id)
+
+                loop.create_task(retry())
         except Exception as exc:
             logger.debug(
                 f"[XiaoAI] Failed to pause suppressed dialog {dialog_id}: {exc}"
@@ -452,6 +477,7 @@ class XiaoAI:
                     await cls._suppress_dialog(
                         dialog_id,
                         f"{namespace}.{header_name}",
+                        force=namespace in {"SpeechSynthesizer", "AudioPlayer"},
                     )
                     return
                 if namespace == "Dialog" and header_name == "Finish":
