@@ -132,6 +132,10 @@ class WakeupSessionManager:
         """position：KWS 命中时唤醒词结束的 GlobalStream 绝对采样位置，
         外部后端对话从这里接着听（"你好缪斯，开灯"里的"开灯"不丢）。"""
         before_wakeup = self.config.get_app_config("wakeup.before_wakeup")
+        if source != "kws":
+            from core.utils.turn_timer import TurnTimer
+
+            TurnTimer.begin(f"{source} 唤醒")  # KWS 命中时已在 KWS 线程开始计时
         kws = get_kws()
         logger.debug(f"[Wakeup] Received wakeup request from {source}: {text}")
 
@@ -164,8 +168,14 @@ class WakeupSessionManager:
         if kws:
             kws.resume()
         logger.info(f"[Wakeup] before_wakeup returned: {should_wakeup}")
+        from core.utils.turn_timer import TurnTimer
+
+        TurnTimer.mark("before_wakeup")
         if should_wakeup is not None:
             await self.reset_all_sessions()
+            TurnTimer.mark("重置会话")
+        else:
+            TurnTimer.clear()
 
         if should_wakeup == "openclaw":
             await self._start_openclaw_conversation(position)

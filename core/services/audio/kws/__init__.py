@@ -13,6 +13,7 @@ from core.services.audio.vad.silero import create_silero
 from core.services.protocols.typing import AudioConfig, DeviceState
 from core.utils.config import ConfigManager
 from core.utils.logger import logger
+from core.utils.turn_timer import TurnTimer, lag_ms
 from core.wakeup_session import EventManager
 
 
@@ -155,6 +156,11 @@ class _KWS:
         # 唤醒词大约在已读到的位置结束（GlobalStream 绝对采样位置）
         position = self.stream.position()
         handler = getattr(self, "_barge_in_handler", None)
+        # 耗时从这里算起；KWS 落后 = 已收到但还没过检测的音频
+        TurnTimer.begin(
+            "打断" if handler is not None else "唤醒词",
+            f"KWS 落后 {lag_ms(self.stream.unread_samples())}ms",
+        )
         if handler is not None:
             try:
                 handler(text, position)

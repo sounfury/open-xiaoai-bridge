@@ -48,6 +48,7 @@ from core.services.tts.segment_player import (
 from core.services.tts.segmenter import ReplySegmenter, SegmenterSettings
 from core.services.tts.wake_reply import WakeReplyPlayer, phrases_from_config, play_reply
 from core.utils.config import ConfigManager
+from core.utils.turn_timer import TurnTimer, lag_ms
 
 _NOTIFY_SOUND_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
@@ -256,6 +257,7 @@ class ExternalConversationController:
         if phrases and self._native_tts():
             # 把应答语提前在音箱上生成好（已有的跳过）
             self._background(WakeReplyPlayer.instance().prepare(get_speaker(), phrases))
+        TurnTimer.mark("进入对话")
 
         try:
             await self._conversation_loop()
@@ -464,16 +466,15 @@ class ExternalConversationController:
                 self._listen_after_keyword(self._wake_position)
             if start_sound:
                 self._light_state("speaking")  # 应答语 / 提示音和播报一样用播报灯，播完回到短白灯
-                if not await self._play_wake_reply("wake"):
-                    await self._play_notify()
+                await self._play_start_sound()
         else:
             await self._stop_recording()
             if start_sound:
                 self._light_state("speaking")
-                if not await self._play_wake_reply("wake"):
-                    await self._play_notify()
+                await self._play_start_sound()
             await self._start_recording()
             await self._skip_mic_start()
+            TurnTimer.mark("重新开麦")
         logger.debug("Ready to listen", module=self.LOG_MODULE)
 
         while self.active:
@@ -495,6 +496,21 @@ class ExternalConversationController:
             elif result in ("error", "interrupted"):
                 # 被 stop() 打断时静默退出，不播告别语、不再操作小爱监听
                 break
+        TurnTimer.clear()
+
+    async def _play_start_sound(self):
+        """唤醒后的应答语（失败时退回提示音）。"""
+        if await self._play_wake_reply("wake"):
+            TurnTimer.mark("应答语播完")
+        else:
+            await self._play_notify()
+            TurnTimer.mark("提示音播完")
+
+    def _log_turn_timing(self):
+        """发给后端前打一行这一轮的耗时。"""
+        summary = TurnTimer.finish(f"发给 {self.BACKEND_NAME}", GlobalStream.samples)
+        if summary:
+            logger.info(f"⏱️ {summary}", module=self.LOG_MODULE)
 
     async def _run_one_turn_with_local_asr(self) -> str:
         """Execute a single conversation turn.
@@ -516,6 +532,7 @@ class ExternalConversationController:
         self._light_state("listening")
         if not self.active:
             return "interrupted"
+        TurnTimer.ensure("开始听")
         listen, self._next_listen = self._next_listen, None
         after_keyword, self._next_after_keyword = self._next_after_keyword, False
         preroll_from, replay_from = listen or (None, None)
@@ -523,6 +540,7 @@ class ExternalConversationController:
             vad, preroll_from=preroll_from, replay_from=replay_from
         )
         if speech_bytes is None:
+            TurnTimer.clear()
             return "timeout"
 
         self._light_state("thinking")
@@ -539,6 +557,7 @@ class ExternalConversationController:
             text = cached[1]  # 断句时已经识别过同一段音频
         else:
             text = ASRService.asr(speech_bytes, sample_rate=16000)
+            TurnTimer.mark("识别", f"{len(speech_bytes) / 32000:.1f}s 音频")
         self._last_asr = None
         if after_keyword:
             # 接着唤醒词听的，开头可能带着唤醒词或它的尾音（"你好缪斯，明天天气怎么样"），去掉
@@ -561,6 +580,7 @@ class ExternalConversationController:
         intent, word = self._exit_intent(text)
         if intent == NOW:
             logger.info(f"Exit word: {word} ({text})", module=self.LOG_MODULE)
+            TurnTimer.clear()
             return "exit"
         if intent == AFTER_ANSWER:
             logger.info(f"Exit after answer: {word} ({text})", module=self.LOG_MODULE)
@@ -569,6 +589,7 @@ class ExternalConversationController:
         full_text = text
         if self.backend._rule_prompt:
             full_text = text + "\n" + self.backend._rule_prompt
+        self._log_turn_timing()
         if self._streaming():
             # 流式：请求在后台读，边收边播
             reply = ReplyStream(self.backend.stream_reply(full_text))
@@ -597,14 +618,18 @@ class ExternalConversationController:
 
     async def _run_one_turn_with_xiaoai_asr(self) -> str:
         """Execute a single conversation turn using XiaoAI native ASR."""
+        TurnTimer.ensure("小爱开始听")
         text = await self._wait_for_xiaoai_asr_text()
         if text is None:
             logger.debug("XiaoAI native ASR turn timed out", module=self.LOG_MODULE)
+            TurnTimer.clear()
             return "timeout"
+        TurnTimer.mark("小爱识别")
 
         intent, word = self._exit_intent(text)
         if intent == NOW:
             logger.info(f"Exit word: {word} ({text})", module=self.LOG_MODULE)
+            TurnTimer.clear()
             return "exit"
         if intent == AFTER_ANSWER:
             logger.info(f"Exit after answer: {word} ({text})", module=self.LOG_MODULE)
@@ -613,6 +638,7 @@ class ExternalConversationController:
         full_text = text
         if self.backend._rule_prompt:
             full_text = text + "\n" + self.backend._rule_prompt
+        self._log_turn_timing()
         if self._streaming():
             reply = ReplyStream(self.backend.stream_reply(full_text))
         else:
@@ -704,7 +730,12 @@ class ExternalConversationController:
                 logger.debug(f"Endpoint ASR failed: {exc}", module=self.LOG_MODULE)
             if not self.active or not self._vad_future or self._vad_future.done():
                 return
-            if text and (looks_unfinished(text) or is_filler_only(text)) and endpoint["pos"] is not None:
+            unfinished = bool(text and (looks_unfinished(text) or is_filler_only(text)))
+            TurnTimer.mark(
+                "断句识别",
+                f"{len(audio) / 32000:.1f}s 音频" + ("，像没说完" if unfinished else ""),
+            )
+            if unfinished and endpoint["pos"] is not None:
                 endpoint["extended"] = True
                 endpoint["count"] += 1
                 vad.silence_override_ms = extra_ms
@@ -719,6 +750,7 @@ class ExternalConversationController:
             nonlocal is_recording
             recording_frames.append(speech_buffer)
             is_recording = True
+            TurnTimer.mark("开口", f"VAD 落后 {lag_ms(vad.stream.unread_samples())}ms")
             self._light_state("hearing")
             logger.debug(f"VAD speech detected, buffer size: {len(speech_buffer)}", module=self.LOG_MODULE)
             # Now wait for silence to know user stopped speaking
@@ -727,6 +759,7 @@ class ExternalConversationController:
         def _on_silence_hook():
             """Silence detected — check whether the sentence looks finished, then resolve."""
             logger.debug("VAD detected silence", module=self.LOG_MODULE)
+            TurnTimer.mark("停顿", f"VAD 落后 {lag_ms(vad.stream.unread_samples())}ms")
             if extra_ms and not endpoint["extended"] and endpoint["count"] < max_extensions:
                 loop.call_soon_threadsafe(lambda: self._background(_check_unfinished()))
                 return
@@ -740,6 +773,7 @@ class ExternalConversationController:
             if is_recording:
                 recording_frames.append(bytes(frames))
                 endpoint["pos"] = vad.stream.position()
+                TurnTimer.speech_end_pos = endpoint["pos"]  # 最后一帧人声：算"说完到发出"
                 if endpoint["extended"]:
                     # 接着说了：恢复正常断句，下次停顿再判断
                     endpoint["extended"] = False
@@ -922,6 +956,7 @@ class ExternalConversationController:
             if isinstance(reply, ReplyStream):
                 await reply.close()
             if self.active and not interrupted and not exit_after:
+                TurnTimer.clear()  # 下一轮从"开始听"重新计时
                 next_sound = bool(self._conv_cfg("next_turn_sound", True))
                 # 有提示音时保持播报灯到提示音播完，下一轮开始时再切短白灯
                 self._light_state("speaking" if next_sound else "listening")
@@ -972,6 +1007,7 @@ class ExternalConversationController:
             open_xiaoai_server.stop_tts_playback(token)
         tts.cancel()
         await asyncio.gather(tts, return_exceptions=True)
+        TurnTimer.mark("停播报")
         speaker = get_speaker()
         self._listen_after_keyword(position)
         logger.info(f"✋ 打断播报: {keyword}", module=self.LOG_MODULE)
@@ -979,7 +1015,9 @@ class ExternalConversationController:
             # 先停干净再应答（stop_device_audio 会 killall miplayer，不能和应答语并发）
             if speaker:
                 await speaker.stop_device_audio()
+                TurnTimer.mark("停设备音频")
             await self._play_wake_reply("barge_in")
+            TurnTimer.mark("应答语播完")
             self._light_state("listening")
         elif speaker:
             self._background(speaker.stop_device_audio())
@@ -1024,6 +1062,7 @@ class ExternalConversationController:
                 f"🙉 忽略疑似音箱自己的声音: {keyword}（近端 {ratio_text} < {min_db} dB）",
                 module=self.LOG_MODULE,
             )
+            TurnTimer.clear()  # KWS 命中时已经开始计时
             return
         logger.info(f"Barge-in: {keyword}, near-end {ratio_text}", module=self.LOG_MODULE)
         hit.set_result((keyword, position))
