@@ -13,19 +13,22 @@ description: |
 - 每次调用前都会经过危险命令规则检查（递归 / 强制删除、格式化、编码命令、强制结束进程等）。被拦截时**不要换写法重试**，直接告诉用户需要他本人在电脑上操作。
 - 不删除、移动、改写用户文件，不安装或卸载软件，不改系统设置、注册表、防火墙和网络。用户的请求超出本 skill 的常用操作时，先说明要执行什么再做。
 - Spotify 的播放、搜索和歌单用官方 Spotify 工具；只有 Spotify 客户端没打开、找不到播放设备时，才用这里启动它。
+- **启动程序必须用 `explorer.exe "完整路径"`，不能用 `Start-Process` 或 cmd 的 `start`。** AgentDock 会在每条命令结束时结束它派生的整棵进程树，`Start-Process` 打开的程序会跟着被关掉（表现为"闪退"），所以这类命令会被拦截钩子直接拒绝。经 `explorer.exe` 启动的程序不属于这棵树，命令结束后仍会运行。`explorer.exe` 本身的退出码不代表成功与否，要用后面的查询确认。
+- `cmd` 是 PowerShell，不要写 cmd 语法（`start ""`、`%APPDATA%`、`tasklist | findstr`）。`Get-Process` 找不到进程时退出码为 1，这表示"没在运行"，不是命令出错。
 
 ## 常用应用
 
 | 应用 | 启动 | 关闭 | 进程名 |
 |---|---|---|---|
-| Spotify | `Start-Process "$env:APPDATA\Spotify\Spotify.exe"` | `Stop-Process -Name Spotify` | `Spotify` |
-| Steam | `Start-Process 'E:\Steam\steam.exe'` | `Start-Process 'E:\Steam\steam.exe' -ArgumentList '-shutdown'` | `steam` |
-| 微信 | `Start-Process 'E:\application\normal\Weixin\Weixin.exe'` | `Stop-Process -Name Weixin` | `Weixin` |
-| QQ | `Start-Process 'E:\application\normal\qq\QQ.exe'` | `Stop-Process -Name QQ` | `QQ` |
+| Spotify | `explorer.exe "$env:APPDATA\Spotify\Spotify.exe"` | `Stop-Process -Name Spotify` | `Spotify` |
+| Steam | `explorer.exe 'E:\Steam\steam.exe'` | `Start-Process 'E:\Steam\steam.exe' -ArgumentList '-shutdown'` | `steam` |
+| 微信 | `explorer.exe 'E:\application\normal\Weixin\Weixin.exe'` | `Stop-Process -Name Weixin` | `Weixin` |
+| QQ | `explorer.exe 'E:\application\normal\qq\QQ.exe'` | `Stop-Process -Name QQ` | `QQ` |
 
 - 查是否在运行：`Get-Process -Name 进程名 -ErrorAction SilentlyContinue`。已在运行时再次启动只会把窗口调出来。
+- 启动 Spotify 后，用一条命令等待并确认，例如 `explorer.exe "$env:APPDATA\Spotify\Spotify.exe"; Start-Sleep 3; @(Get-Process Spotify -EA SilentlyContinue).Count`，再用 Spotify 设备工具查询；设备通常在 5～10 秒内出现，最多再查一两次，不要反复重启客户端。命令总时长保持在 5 秒以内，超过后 AgentDock 会把命令转入后台。
 - Steam 用 `-shutdown` 正常退出，不直接结束进程。关闭微信、QQ 前提醒用户未发送的消息可能丢失。
-- 不在表里的程序：先用 `Get-StartApps | Where-Object Name -match '关键词'` 查找，再用 `Start-Process` 启动；找不到就告诉用户，不要猜路径。
+- 不在表里的程序：先用 `Get-StartApps | Where-Object Name -match '关键词'` 查找，再用 `explorer.exe "shell:AppsFolder\<AppID>"` 启动；找不到就告诉用户，不要猜路径。
 
 ## 系统操作
 
