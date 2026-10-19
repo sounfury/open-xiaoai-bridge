@@ -128,5 +128,13 @@ class _SherpaOnnx:
     def fork(self) -> SherpaKeywordSpotter:
         return self.spotter.fork()
 
+    def new_spotter(self) -> SherpaKeywordSpotter:
+        """另建一个独立的模型实例（配置相同），可以在别的线程里和原件同时跑。
+
+        fork() 共用模型，只能和原件串行；多麦 3 路 + ch0 串行解码时每帧 32 ms 要算约 48 ms，
+        说话时越积越多（唤醒晚 0.4～0.5 秒）；各路独立实例并行时约 16 ms。
+        """
+        return SherpaKeywordSpotter(get_model_file_path("keywords.txt"), **spotter_settings())
+
 
 SherpaOnnx = _SherpaOnnx()

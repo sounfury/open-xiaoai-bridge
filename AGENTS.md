@@ -175,6 +175,7 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 - 工具开始、还没有正文时念一次 `openai.tool_filler`（"稍等" / "我查一下"）
 - 打断覆盖整个回复过程（包括后端还在思考）：取消 `_speak` 任务 → `player.abort()`（`killall miplayer`、删临时文件）+ `ReplyStream.close()`（断开 HTTP）
 - 分段播放一段都没播成（`player.error` 且 `played == 0`）时，整段退回 `_play_tts`
+- 回复里调用了 `openai.end_after_tools`（默认 `spotify_playback`）里的工具时，回答完直接结束对话（不播告别语）：对话中途才放的歌没被 music_duck 压低，接着听会把歌声当成人声，对话永远结束不了。Hermes 工具事件不带参数，分不出播放和查询，一律结束
 
 **灯效**（`core/services/conversation_light.py`）:
 - OpenAI / 缪斯会话调用 `_light_state(state)`，和原生小爱一致：提示音 / 回答 `speaking` 3（跟播放音量起伏，miplayer 自带）→ `listening` / `hearing` 41（短白灯，随你的音量变宽）→ `thinking` 2 → `speaking` 3 → `off`；不再用黄灯 9
@@ -283,7 +284,7 @@ HTTP REST API 服务器（aiohttp），端口可配（默认 9092），默认监
 
 - 音箱 `hw:0,3`（Capture）4 声道 48 kHz S32：**ch0～ch2 是 3 个麦克风**，ch3 是播放回采；client 的 echo_ref 只发 ch0 + ch3
 - 原生小爱（`mipns-xiaomi`，配置 `/usr/share/mipns/vpm/json_segment/flexkws.json5`）：Kalman AEC → 去混响 → IVA 分离 3 路 → 每路一个约 200 KB 的专用唤醒模型（只有"小爱同学"的 10 个音素单元，不能改成别的词）→ 选通道 → 二级模型复核
-- 我们的做法（`multimic.enabled` / `MULTIMIC_ENABLE=1`）：bridge 开 4401，音箱 `arecord -D Capture -f S16_LE -r 16000 -c 4 | nc`（不改 client；S16 ≈ S32 >> 16，乘 `gain` 256 对齐线上电平）→ 每麦 AEC → 在线 AuxIVA → 额外 3 路 `KeywordDetector`（`SherpaOnnx.fork()` 共用模型），和 ch0 并行；第一路命中即唤醒，2 秒内其余路的命中只记日志
+- 我们的做法（`multimic.enabled` / `MULTIMIC_ENABLE=1`）：bridge 开 4401，音箱 `arecord -D Capture -f S16_LE -r 16000 -c 4 | nc`（不改 client；S16 ≈ S32 >> 16，乘 `gain` 256 对齐线上电平）→ 每麦 AEC → 在线 AuxIVA → 额外 3 路 `KeywordDetector`（`SherpaOnnx.new_spotter()` 各自独立模型，在线程池里和 ch0 并行解码；共用模型串行时每 32 ms 帧要算约 48 ms，说话时唤醒会晚 0.4～0.5 秒），和 ch0 并行；第一路命中即唤醒，2 秒内其余路的命中只记日志
 - VAD / ASR / 打断补录仍走原来的单声道；看门狗 `stale_s` 秒没数据就重新在音箱上启动
 - 离线对比：`scripts/multimic_record.py` 录 4 声道 → `scripts/multimic_eval.py --asr`
 

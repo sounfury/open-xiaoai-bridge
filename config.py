@@ -152,8 +152,10 @@ APP_CONFIG = {
         "keyword_tail_ms": 100,
         # 没有回采、重新开麦后丢掉开头这么长（可能带着提示音余音），ms
         "mic_start_skip_ms": 150,
-        # 断句：停顿这么久算说完（只用于连续对话，vad.min_silence_duration 给小智流程用），ms
-        "end_silence_ms": 800,
+        # 断句：停顿这么久算说完（只用于连续对话，vad.min_silence_duration 给小智流程用），ms。
+        # OwnDing 在同款音箱上用 500（他的延迟报告建议还能降到 300～350）；这里另有下面的
+        # "像没说完再等"兜底。800 时"说完到发出"约 1.0 秒，其中 0.8 秒是这段等待
+        "end_silence_ms": 500,
         # 停顿时先识别一遍，像没说完（"今天会很"、"帮我把"、"那个"）就接着听，静音总共等到这么久，ms；
         # 规则见 core/utterance.py。设成和 end_silence_ms 一样就关闭
         "hesitation_silence_ms": 1800,
@@ -232,8 +234,10 @@ APP_CONFIG = {
         "echo_reference": True,
         # 双声道里麦克风声道电平偏低，消除回声后乘这个倍数回到单声道录音的电平（之后再乘 audio_input.gain）
         "echo_mic_gain": 64,
-        # 打断后补录：从唤醒词结束前这么多毫秒开始，接上"你好缪斯，明天天气怎么样"里后半句（ms）
-        "speech_lookback_ms": 350,
+        # 打断后补录：从唤醒词结束前这么多毫秒开始，接上"你好缪斯，明天天气怎么样"里后半句（ms）。
+        # OwnDing 的 350 是给单音节的"七"定的；"缪斯"会被带进请求（"司今天有什么安排"）。
+        # kws_acceptance.py dialog：350 → 52/100，200 → 86，150 → 90，100 → 88（2026-10-19）
+        "speech_lookback_ms": 150,
         # 刚播放过声音的那一小段（播放中、停播后 echo_vad_hangover_ms 内），消除后剩下的残留
         # 仍可能被当成说话；这段时间里说话判定用这个更高的阈值（真人说话约 1.0）。None = 不提高
         "echo_vad_threshold": 0.7,
@@ -398,6 +402,9 @@ APP_CONFIG = {
             # 这些工具不算（tool_describe 只是读工具说明，每次调用工具前都有）
             "ignore_tools": ["tool_describe"],
         },
+        # 回复里调用了这些工具（放 / 切 / 暂停音乐）就在回答完结束对话，不再接着听：对话中途才放的歌没被压低，
+        # 接着听会把歌声当成你在说话，对话结束不了（OwnDing 和原生小爱放歌后也是直接结束）。[] = 关闭
+        "end_after_tools": ["spotify_playback"],
         "tts_speed": 1.0,
         "tts_speaker": "xiaoai",
         "session_tts_speakers": {},

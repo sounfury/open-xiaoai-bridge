@@ -4,6 +4,7 @@ import asyncio
 import os
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from core.ref import get_app, get_xiaoai, get_xiaozhi, set_kws
 from core.services.audio.kws.detector import FRAME_SAMPLES, KeywordDetector
@@ -38,6 +39,8 @@ class _KWS:
         # 多麦唤醒（core/services/audio/multimic_input.py）：路名 → 检测器，和 ch0 并行，任一路命中即唤醒
         self.multimic = None
         self.extra_detectors: dict[str, KeywordDetector] = {}
+        # 多麦各路和 ch0 并行解码（onnxruntime 推理时释放 GIL）；每帧等各路都跑完再读下一帧
+        self._pool: ThreadPoolExecutor | None = None
         self._last_hit = 0.0
         self.hit_counts: dict[str, int] = {}
         self._barge_in_handler = None
@@ -115,11 +118,12 @@ class _KWS:
             self.multimic = None
         if self.multimic is None:
             return
-        # 每路一个独立的解码状态和 Silero（模型共用）
+        # 每路独立的唤醒模型和 Silero，在线程池里和 ch0 并行跑
         self.extra_detectors = {
-            name: KeywordDetector(SherpaOnnx.fork(), create_silero(), **self._detector_settings())
+            name: KeywordDetector(SherpaOnnx.new_spotter(), create_silero(), **self._detector_settings())
             for name in self.multimic.names
         }
+        self._pool = ThreadPoolExecutor(max_workers=len(self.extra_detectors), thread_name_prefix="kws-mic")
 
     def _reset_detectors(self):
         self.detector.reset()
@@ -188,6 +192,15 @@ class _KWS:
 
     # ===== 私有方法 =====
 
+    @staticmethod
+    def _process_chunks(detector: KeywordDetector, chunks: list[bytes]) -> str | None:
+        """同一路的几帧按顺序处理，返回第一个命中。"""
+        for chunk in chunks:
+            result = detector.process(chunk)
+            if result:
+                return result
+        return None
+
     def _on_config_reload(self, *_args):
         """配置重载后刷新运行时参数。"""
         self.apply_runtime_config()
@@ -224,16 +237,26 @@ class _KWS:
                 self._reset_detectors()
                 extra = []
 
+            # 多麦各路先交给线程池（同一路的几帧在一个任务里按顺序处理），再在本线程跑 ch0
+            chunks: dict[str, list[bytes]] = {}
+            for name, chunk in extra:
+                if name in self.extra_detectors:
+                    chunks.setdefault(name, []).append(chunk)
+            futures = [
+                (name, self._pool.submit(self._process_chunks, self.extra_detectors[name], items))
+                for name, items in chunks.items()
+            ]
             hits: list[tuple[str, str]] = []
             if mono_ready:
                 result = self.detector.process(frames)
                 if result:
                     hits.append(("ch0", result))
-            for name, chunk in extra:
-                detector = self.extra_detectors.get(name)
-                if detector is None:
+            for name, future in futures:
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    logger.error(f"[KWS] {name} 检测失败: {type(exc).__name__}: {exc}")
                     continue
-                result = detector.process(chunk)
                 if result:
                     hits.append((name, result))
             if not hits:

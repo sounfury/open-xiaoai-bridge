@@ -188,6 +188,10 @@ class ExternalConversationController:
         # 下一轮是接着唤醒词听的（识别结果开头可能带着唤醒词，要去掉）
         self._next_after_keyword = False
         self._background_tasks: set[asyncio.Task] = set()
+        # 这一轮回复里后端调用过的工具（流式的 hermes.tool.progress）
+        self._reply_tools: set[str] = set()
+        # 这一轮因为放了音乐等原因，回答完就结束对话
+        self._end_after_reply = False
 
     @property
     def exit_keywords(self) -> list[str]:
@@ -612,7 +616,7 @@ class ExternalConversationController:
 
         exit_after = intent == AFTER_ANSWER
         interrupted = await self._play_reply_and_resume(reply, vad, exit_after=exit_after)
-        if exit_after and not interrupted:
+        if (exit_after or self._end_after_reply) and not interrupted:
             return "exit_after_answer"
         return "continue"
 
@@ -650,7 +654,7 @@ class ExternalConversationController:
 
         exit_after = intent == AFTER_ANSWER
         interrupted = await self._play_reply_and_resume(reply, exit_after=exit_after)
-        if exit_after and not interrupted:
+        if (exit_after or self._end_after_reply) and not interrupted:
             return "exit_after_answer"
         return "continue"
 
@@ -939,9 +943,12 @@ class ExternalConversationController:
         播完后下一轮从"播完 + tts_end_guard_ms"开始回放，用户一接话就能听到。
         没有回采时关麦播报，播完（可选）放提示音再开麦，丢掉开麦后的一小段。
         exit_after：这是最后一轮（"关灯，拜拜"），播完不再准备下一轮。
+        回复里调用了 end_after_tools 里的工具（放音乐）时也一样，并把 self._end_after_reply 置为 True。
         """
         barge_in = self._barge_in_ready()
         interrupted = False
+        self._reply_tools = set()
+        self._end_after_reply = False
         try:
             if not barge_in:
                 await self._stop_recording()
@@ -955,6 +962,8 @@ class ExternalConversationController:
         finally:
             if isinstance(reply, ReplyStream):
                 await reply.close()
+            if not interrupted and not exit_after and self._reply_ends_conversation():
+                exit_after = self._end_after_reply = True
             if self.active and not interrupted and not exit_after:
                 TurnTimer.clear()  # 下一轮从"开始听"重新计时
                 next_sound = bool(self._conv_cfg("next_turn_sound", True))
@@ -1141,6 +1150,8 @@ class ExternalConversationController:
                     last_text_at = loop.time()
                     await add(segmenter.feed(value))
                 elif kind == "tool":
+                    if value.get("tool"):
+                        self._reply_tools.add(str(value["tool"]))
                     text = filler.on_event(value, spoken=bool(segments))
                     if text:
                         marks["filler"] = loop.time() - started
@@ -1179,6 +1190,18 @@ class ExternalConversationController:
             if not finished:
                 await player.abort()
             await reply.close()
+
+    def _reply_ends_conversation(self) -> bool:
+        """这一轮放了 / 切了 / 暂停了音乐：回答完就结束对话（OwnDing 和原生小爱都这样）。
+
+        音乐是对话中途才开始放的，进对话时压低音量没压到它；接着听的话 VAD 会把歌声当成你在说话，
+        对话永远结束不了。Hermes 的工具事件不带参数，分不出"播放"和"查当前歌曲"，一律结束。
+        """
+        tools = self._cfg("end_after_tools", ["spotify_playback"]) or []
+        hit = sorted(self._reply_tools & {str(t) for t in tools})
+        if hit:
+            logger.info(f"🎵 这轮调用了 {', '.join(hit)}，回答完结束对话", module=self.LOG_MODULE)
+        return bool(hit)
 
     async def _play_tts(self, text: str):
         """Play text via Doubao TTS (blocks until playback finishes)."""
