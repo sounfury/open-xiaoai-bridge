@@ -51,6 +51,9 @@ class XiaoAI:
     conversation = XiaoAIConversationController()
     _input_gain_enabled = False
     _input_gain = 1.0
+    # 高通滤波（audio_input.highpass_hz），在增益之前；None = 不滤波
+    _highpass = None
+    _highpass_hz = None
     # 双声道录音里麦克风声道的电平比单声道录音低，乘这个倍数回到原来的电平
     _echo_mic_gain = 64.0
     _echo_dump: dict | None = None
@@ -87,6 +90,14 @@ class XiaoAI:
             gain = 1.0
         cls._input_gain = max(1.0, min(gain, 8.0))
         cls._input_gain_enabled = cls._input_gain > 1.0
+        highpass_hz = cls.config_manager.get_app_config("audio_input.highpass_hz", None)
+        if highpass_hz != cls._highpass_hz:
+            from core.services.audio.highpass import make_highpass
+
+            cls._highpass = make_highpass(highpass_hz)
+            cls._highpass_hz = highpass_hz
+            if cls._highpass is not None:
+                logger.info(f"[XiaoAI] 输入高通滤波 {cls._highpass.cutoff_hz:g} Hz")
         wakeup_keywords = cls.config_manager.get_app_config("wakeup.keywords", [])
         cls._external_wakeup_keywords = {
             cls._normalize_text(keyword)
@@ -336,7 +347,11 @@ class XiaoAI:
     def on_input_data(cls, data: bytes):
         cls._last_input_at = time.monotonic()
         audio_array = np.frombuffer(data, dtype=np.int16)
-        if cls._input_gain_enabled and audio_array.size > 0:
+        highpass = cls._highpass
+        if highpass is not None and audio_array.size > 0:
+            filtered = highpass.process(audio_array) * (cls._input_gain if cls._input_gain_enabled else 1.0)
+            audio_array = np.clip(np.round(filtered), -32768, 32767).astype(np.int16)
+        elif cls._input_gain_enabled and audio_array.size > 0:
             boosted = audio_array.astype(np.float32) * cls._input_gain
             audio_array = np.clip(boosted, -32768, 32767).astype(np.int16)
         pcm = audio_array.tobytes()

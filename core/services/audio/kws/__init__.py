@@ -16,6 +16,10 @@ from core.utils.logger import logger
 from core.wakeup_session import EventManager
 
 
+# 多路检测时，第一次命中后这么久内其它路的命中算同一次（秒）
+MULTI_HIT_WINDOW_S = 2.0
+
+
 class _KWS:
     def __init__(self):
         set_kws(self)
@@ -30,6 +34,11 @@ class _KWS:
         self.sample_rate = 16000
         self.paused = False
         self.detector: KeywordDetector | None = None
+        # 多麦唤醒（core/services/audio/multimic_input.py）：路名 → 检测器，和 ch0 并行，任一路命中即唤醒
+        self.multimic = None
+        self.extra_detectors: dict[str, KeywordDetector] = {}
+        self._last_hit = 0.0
+        self.hit_counts: dict[str, int] = {}
         self._barge_in_handler = None
         self._barge_in_reset = False
         # 上一帧是否被跳过（暂停 / 小智对话中）：恢复处理时音频不连续，要清状态
@@ -48,6 +57,8 @@ class _KWS:
         self.vad_gate = bool(kws_config.get("vad_gate", True))
         if self.detector is not None:
             self.detector.configure(**self._detector_settings())
+        for detector in self.extra_detectors.values():
+            detector.configure(**self._detector_settings())
 
     def _detector_settings(self) -> dict:
         return {
@@ -66,6 +77,7 @@ class _KWS:
         SherpaOnnx.start()
         # 独立的 Silero：VAD 线程也在用全局那个，两路音频交替送进同一个实例会互相污染状态
         self.detector = KeywordDetector(SherpaOnnx, create_silero(), **self._detector_settings())
+        self._start_multimic()
         self.audio = MyAudio.create()
         self.stream = self.audio.open(
             format=AudioConfig.FORMAT,
@@ -91,6 +103,29 @@ class _KWS:
             f"VAD:[gate:{self.vad_gate}, threshold:{self.vad_threshold}, "
             f"min_silence:{self.min_silence_ms}ms, preroll:{self.preroll_ms}ms]",
         )
+
+    def _start_multimic(self):
+        from core.services.audio.multimic_input import get_multimic
+
+        try:
+            self.multimic = get_multimic(self.config_manager.get_app_config("multimic", {}) or {})
+        except Exception as exc:
+            logger.error(f"[KWS] 多麦唤醒输入启动失败，只用 ch0: {type(exc).__name__}: {exc}")
+            self.multimic = None
+        if self.multimic is None:
+            return
+        # 每路一个独立的解码状态和 Silero（模型共用）
+        self.extra_detectors = {
+            name: KeywordDetector(SherpaOnnx.fork(), create_silero(), **self._detector_settings())
+            for name in self.multimic.names
+        }
+
+    def _reset_detectors(self):
+        self.detector.reset()
+        for detector in self.extra_detectors.values():
+            detector.reset()
+        if self.multimic is not None:
+            self.multimic.discard()
 
     def get_file_path(self, file_name: str):
         current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -154,16 +189,19 @@ class _KWS:
     def _detection_loop(self):
         self.stream.start_stream()
         while True:
-            # 读取缓冲区音频数据
+            # 读取缓冲区音频数据（ch0 单声道 + 多麦各路）
             frames = self.stream.read(self.frame_size)
-            if len(frames) != self.frame_size * 2:
+            mono_ready = len(frames) == self.frame_size * 2
+            extra = self.multimic.pull() if self.multimic is not None else []
+            if not mono_ready and not extra:
                 time.sleep(0.01)
                 continue
 
             # 武装/解除打断检测时清掉上一段的识别状态，避免旧音频拼进新的检测
             if self._barge_in_reset:
                 self._barge_in_reset = False
-                self.detector.reset()
+                self._reset_detectors()
+                extra = []
 
             # 在说话和监听状态时，暂停 KWS（播报中打断检测除外）
             xiaozhi = get_xiaozhi()
@@ -177,12 +215,38 @@ class _KWS:
             if self._skipped:
                 # 中间有音频没处理，旧的识别状态接不上
                 self._skipped = False
-                self.detector.reset()
+                self._reset_detectors()
+                extra = []
 
-            result = self.detector.process(frames)
-            if result:
-                logger.wakeup(result, module="KWS")
-                self._dispatch(result)
+            hits: list[tuple[str, str]] = []
+            if mono_ready:
+                result = self.detector.process(frames)
+                if result:
+                    hits.append(("ch0", result))
+            for name, chunk in extra:
+                detector = self.extra_detectors.get(name)
+                if detector is None:
+                    continue
+                result = detector.process(chunk)
+                if result:
+                    hits.append((name, result))
+            if not hits:
+                continue
+            now = time.monotonic()
+            for name, _ in hits:
+                self.hit_counts[name] = self.hit_counts.get(name, 0) + 1
+            names = ", ".join(name for name, _ in hits)
+            # 同一句话会被几路先后认出来（多麦链路比 ch0 晚约 80 ms）：第一路命中就唤醒，
+            # 其余路照常跑，窗口内再命中只记日志（看哪几路认出了同一次）
+            if self.extra_detectors and now - self._last_hit < MULTI_HIT_WINDOW_S:
+                logger.info(f"[KWS] 同一次唤醒也被 {names} 认出")
+                continue
+            self._last_hit = now
+            source, result = hits[0]
+            if self.extra_detectors:
+                logger.info(f"[KWS] 命中来源: {names}（累计 {self.hit_counts}）")
+            logger.wakeup(result, module="KWS")
+            self._dispatch(result)
 
 
 KWS = _KWS()

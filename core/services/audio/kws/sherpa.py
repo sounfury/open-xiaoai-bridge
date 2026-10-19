@@ -65,6 +65,16 @@ class SherpaKeywordSpotter:
         self.streams = [self.keyword_spotter.create_stream() for _ in self.offsets]
         self.skip = list(self.offsets)  # 每路还要丢掉多少采样才能保持错开
 
+    def fork(self) -> "SherpaKeywordSpotter":
+        """共用同一个模型、解码状态独立的副本（多麦的每一路一个）。必须和原件在同一个线程里用。"""
+        clone = object.__new__(SherpaKeywordSpotter)
+        clone.keyword_spotter = self.keyword_spotter
+        clone.offsets = list(self.offsets)
+        clone.streams = []
+        clone.skip = []
+        clone.reset()
+        return clone
+
     def kws(self, frames: bytes) -> str | None:
         samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
         for i, stream in enumerate(self.streams):
@@ -114,6 +124,9 @@ class _SherpaOnnx:
 
     def kws(self, frames):
         return self.spotter.kws(frames) if self.spotter is not None else None
+
+    def fork(self) -> SherpaKeywordSpotter:
+        return self.spotter.fork()
 
 
 SherpaOnnx = _SherpaOnnx()
