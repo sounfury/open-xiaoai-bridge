@@ -31,6 +31,7 @@ open-xiaoai-bridge/
 │   │   ├── api_server.py          # HTTP REST API（aiohttp）
 │   │   ├── conversation_light.py  # 连续对话灯效（状态驱动、后台切换）
 │   │   ├── light_level.py         # 聆听灯随麦克风音量起伏（推噪声给音箱 vis）
+│   │   ├── music_duck.py          # 对话期间压低音乐：Spotify（SSH 长连接 → Oracle 上 deploy/music-duck/music_duck.py）+ 音箱 mediaplayer 暂停
 │   │   ├── tts/router.py           # 统一 TTS provider 路由与播放
 │   │   ├── tts/wake_reply.py       # 唤醒 / 打断后的应答语（小爱原生 TTS 生成后缓存在音箱 /tmp）
 │   │   ├── tts/segmenter.py        # 流式回复切段 + 朗读前清理（Markdown / <think> / 开头英文）
@@ -38,6 +39,9 @@ open-xiaoai-bridge/
 │   │   ├── audio/
 │   │   │   ├── stream.py          # GlobalStream 全局音频流（多路输入广播，保留最近 3 秒）
 │   │   │   ├── aec.py             # 子带回声消除（移植自 OwnDing/open-xiaoai）
+│   │   │   ├── highpass.py        # 流式高通滤波（audio_input.highpass_hz，单声道和多麦都用）
+│   │   │   ├── multimic.py        # 多麦前端：流式 STFT、在线 AuxIVA 盲源分离、3 麦求和
+│   │   │   ├── multimic_input.py  # 多麦唤醒输入：音箱 arecord 4 声道 | nc → AEC → IVA → 额外几路 KWS 输入
 │   │   │   ├── codec.py           # 音频编解码
 │   │   │   ├── vad/silero.py      # Silero VAD 语音活动检测（ONNX）
 │   │   │   ├── kws/sherpa.py      # Sherpa KWS 关键词唤醒
@@ -274,6 +278,25 @@ HTTP REST API 服务器（aiohttp），端口可配（默认 9092），默认监
 | KWS | `audio/kws/sherpa.py` | Sherpa ONNX 关键词唤醒（信心度 2.0，阈值 0.2） |
 | ASR | `audio/asr/sherpa.py` | Sherpa SenseVoice 离线语音识别（懒加载，INT8 量化） |
 | TTS | `tts/openai.py`, `tts/mlx_audio.py`, `tts/doubao.py` | OpenAI-compatible TTS、MLX-Audio 与豆包 TTS（一次性/本地音频播放） |
+
+### 多麦唤醒（multimic，默认关闭）
+
+- 音箱 `hw:0,3`（Capture）4 声道 48 kHz S32：**ch0～ch2 是 3 个麦克风**，ch3 是播放回采；client 的 echo_ref 只发 ch0 + ch3
+- 原生小爱（`mipns-xiaomi`，配置 `/usr/share/mipns/vpm/json_segment/flexkws.json5`）：Kalman AEC → 去混响 → IVA 分离 3 路 → 每路一个约 200 KB 的专用唤醒模型（只有"小爱同学"的 10 个音素单元，不能改成别的词）→ 选通道 → 二级模型复核
+- 我们的做法（`multimic.enabled` / `MULTIMIC_ENABLE=1`）：bridge 开 4401，音箱 `arecord -D Capture -f S16_LE -r 16000 -c 4 | nc`（不改 client；S16 ≈ S32 >> 16，乘 `gain` 256 对齐线上电平）→ 每麦 AEC → 在线 AuxIVA → 额外 3 路 `KeywordDetector`（`SherpaOnnx.fork()` 共用模型），和 ch0 并行；第一路命中即唤醒，2 秒内其余路的命中只记日志
+- VAD / ASR / 打断补录仍走原来的单声道；看门狗 `stale_s` 秒没数据就重新在音箱上启动
+- 离线对比：`scripts/multimic_record.py` 录 4 声道 → `scripts/multimic_eval.py --asr`
+
+### 对话期间压低音乐（music_duck）
+
+- 音乐一直响会被唤醒后的 VAD / ASR 当成用户说话（歌词被识别成问题，对话停不下来）；`ExternalConversation.start()` 压低、`stop()` 恢复，都不阻塞
+- Spotify：bridge 启动时建 SSH 长连接（每次新开 SSH 到 Oracle 要 2～3 秒），stdin 发 `duck` / `restore`；远端用 Spotify Web API，压到 `volume`（默认 15%），设备不支持调音量就暂停
+  - `/me/player` 的音量要 1～1.5 秒才更新：恢复时读到"压低后"或"压低前"的值都照常恢复，只有第三个值才算用户自己调过
+  - SSH 断开（bridge 退出 / 断网）远端自己恢复；压低超过 300 秒也自动恢复
+  - access token 只放内存（Hermes 容器以 root 写的 token.json ubuntu 读不了）；Spotify 换发 refresh_token 时必须原子写回 auth.json，否则 Hermes 的 spotify_ctl 失效
+  - 必须用 Git 自带的 ssh：Windows OpenSSH 嫌 `~/.ssh/config` 权限太宽（CodexSandboxUsers）会直接退出
+- 音箱播放器：`player_get_play_status` status == 1 时 `player_play_operation pause`，退出时只在 status == 2 且是我们暂停的才 `play`（status 含义未在真机播放时验证）
+- 高通滤波（`audio_input.highpass_hz` 120）：离线对比（146 条合成唤醒词 × 3 种起点，叠加真实房间底噪 / 50 Hz 嗡声）对唤醒率影响在 ±1% 内，不伤人声也不提升唤醒
 
 ### Rust 原生扩展 (native/)
 

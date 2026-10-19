@@ -187,6 +187,40 @@ APP_CONFIG = {
         # OwnDing 客户端（S32 >> 8）比旧客户端（S16，相当于 >> 16）响 256 倍，说话时已接近满幅，不要再放大；
         # 旧客户端时这里是 4.0。
         "gain": 1.0,
+        # 高通滤波（Hz）：去掉这个频率以下的低频（空调 / 冰箱嗡声、桌面震动、音乐低音鼓），人声不受影响。
+        # 单声道（VAD / KWS / ASR）和多麦链路都用。None / 0 = 关闭
+        "highpass_hz": 120,
+    },
+    # 对话期间压低音乐（core/services/music_duck.py）：进入连续对话时压低，退出时恢复。
+    # 音乐一直响会被 VAD / ASR 当成你在说话（歌词被识别成问题，对话停不下来）。
+    "music_duck": {
+        "enabled": True,
+        # Spotify：经 SSH 长连接调 Oracle 上的 deploy/music-duck/music_duck.py（Spotify Web API，
+        # 不管在电脑还是手机上放都管用）。bridge 退出 / 断网时脚本自己恢复音量。
+        "spotify": {
+            "enabled": True,
+            "ssh_host": "oracle",  # ~/.ssh/config 里的主机名（密钥登录）
+            # 不填则优先用 Git 自带的 ssh（Windows OpenSSH 嫌 ~/.ssh/config 权限太宽会拒绝）
+            "ssh_bin": None,
+            "command": "python3 -u ~/home-tools/spotify/music_duck.py serve",
+            "volume": 15,  # 压到这个音量（%）；本来就更小则不动
+        },
+        # 音箱自己的播放器（mediaplayer）：正在播就暂停，退出时只继续由我们暂停的
+        "speaker": {"enabled": True},
+    },
+    # 多麦唤醒（core/services/audio/multimic_input.py）：音箱 3 个麦克风 + 回采另走一条 arecord | nc，
+    # 每路回声消除后 IVA 分离成 3 路（和原生小爱一样的思路），和原来的 ch0 并行检测，任一路命中即唤醒。
+    # VAD / ASR 仍走原来的单声道。环境变量 MULTIMIC_ENABLE=1/0 可覆盖 enabled。
+    # 离线对比：scripts/multimic_record.py 录 4 声道 → scripts/multimic_eval.py
+    "multimic": {
+        "enabled": True,
+        "port": 4401,  # 音箱 nc 连过来的端口
+        # 额外跑唤醒的信号："iva"（分离出的 3 路）、"sum"（3 麦平均）、"ch1" / "ch2"（单个麦克风）
+        "outputs": ["iva"],
+        "gain": 256,  # S16（≈ S32 >> 16）乘这个倍数，对齐线上单声道的电平
+        "iva_alpha": 0.97,  # IVA 遗忘因子（每帧 16 ms；越大越稳、跟得越慢）
+        "echo_cancel": True,  # 每路麦克风先用 ch3 回采消回声（播报中打断需要）
+        "stale_s": 5,  # 这么久没收到数据就重新在音箱上启动录音
     },
     "barge_in": {
         # 播报时喊唤醒词（如"你好缪斯"）可以打断，然后直接说新的问题（需要 echo_reference）。

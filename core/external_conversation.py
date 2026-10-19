@@ -250,6 +250,8 @@ class ExternalConversationController:
         )
 
         logger.info(f"🎙️ 进入 {self.BACKEND_NAME} 连续对话模式", module=self.LOG_MODULE)
+        # 音乐一直响会被当成你在说话：对话期间压低，stop() 时恢复（不阻塞）
+        self._duck_music(True)
         phrases = phrases_from_config(self._conv_cfg("wake_reply", {}))
         if phrases and self._native_tts():
             # 把应答语提前在音箱上生成好（已有的跳过）
@@ -283,6 +285,7 @@ class ExternalConversationController:
         if kws and hasattr(kws, "disarm_barge_in"):
             kws.disarm_barge_in()
         self._light_state("off")
+        self._duck_music(False)
         if self._playback_token is not None:
             open_xiaoai_server.stop_tts_playback(self._playback_token)
             self._playback_token = None
@@ -300,6 +303,20 @@ class ExternalConversationController:
                         module=self.LOG_MODULE,
                     )
         logger.info(f"👋 退出 {self.BACKEND_NAME} 连续对话模式", module=self.LOG_MODULE)
+
+    def _duck_music(self, duck: bool):
+        try:
+            from core.services.music_duck import MusicDucker
+
+            ducker = MusicDucker.instance()
+            if ducker is None:
+                return
+            if duck:
+                ducker.duck(self._loop)
+            else:
+                ducker.restore(self._loop)
+        except Exception as exc:
+            logger.debug(f"Music duck failed: {type(exc).__name__}: {exc}", module=self.LOG_MODULE)
 
     def consume_xiaoai_recognize_result(
         self,

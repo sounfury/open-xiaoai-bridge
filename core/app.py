@@ -240,6 +240,14 @@ class MainApp:
                 VAD.start()
                 KWS.start()
                 logger.info("[MainApp] Audio input enabled (VAD/KWS started)")
+                try:
+                    from core.services.music_duck import MusicDucker
+
+                    ducker = MusicDucker.instance()
+                    if ducker is not None:
+                        ducker.warm_up()
+                except Exception as exc:
+                    logger.warning(f"[MainApp] Music duck warm-up failed: {exc}")
             else:
                 logger.info("[MainApp] Audio input disabled (VAD/KWS not started)")
 
