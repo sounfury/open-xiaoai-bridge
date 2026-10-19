@@ -1,6 +1,6 @@
 # Hermes 家庭助手 PRD
 
-> 状态：需求持续整理；Spotify 官方插件、米家 CLI＋skill 与 Windows（AgentDock）基础接入已完成。米家只读链路已验收；Windows 控制、米家控制 / 播报等用户故事仍需实机验收。最后更新：2026-10-18。
+> 状态：需求持续整理；Spotify 官方插件、米家 CLI＋skill 与 Windows（AgentDock）基础接入已完成。米家只读链路已验收；Windows 控制、米家控制 / 播报等用户故事仍需实机验收。最后更新：2026-10-19。
 > 适用部署：Oracle 上的 Hermes，profile `muse-home`。
 > 本文独立管理云端助手的需求与验收，不再沿用音箱 bridge 的迁移阶段编号。音箱只是交互入口之一，网页聊天同样需要具备这些能力。
 
@@ -64,7 +64,7 @@
 | 编号 | 场景 | 预期与验收 |
 |---|---|---|
 | S2 | “我今晚想洗澡” | 读取记忆中的入睡时间、洗澡与加热习惯，安排热水器提前开启并说清时间；缺少必要习惯或加热参数时询问，不编造 |
-| S4 | “打开热水器 / 电热毯” | 执行后按需安排提醒；“洗完了 / 关掉”关闭设备并取消对应提醒。防忘关不由 Hermes 常驻服务承担：电热毯由用户在米家设定时开关；热水器改用米家自动化兜底（具体方式待用户选定） |
+| S4 | “打开热水器 / 电热毯” | 执行后按需安排提醒；“洗完了 / 关掉”关闭设备并取消对应提醒。防忘关不由 Hermes 常驻服务承担：电热毯由用户在米家设定时开关；热水器通电时由 Hermes 同时建一次性定时关闭任务（cron），手动关闭时取消 |
 | S5 | “播放 Spotify / 打开 xx 软件” | Spotify 播放使用官方插件；启动 / 关闭 Windows 程序、音量、锁屏等经 AgentDock 与 `windows-control` skill 执行 |
 | S6 | 不在家，从网页说“把空调关了” | 直接调用云端米家工具，Windows 关机时仍可执行 |
 | S7 | 长对话或新会话中控制设备 | 设备知识和稳定习惯仍有效，不依赖早先对话是否留在上下文中 |
@@ -225,7 +225,7 @@ bridge 只负责音箱交互和与云端协议对接。Hermes 的个人数据、
 - 用户认为 CLI 本身不需要容器隔离。CLI 改装到 Hermes 持久化目录：独立虚拟环境 `/opt/data/tools/mijia/venv`，入口 `/opt/data/.local/bin/mijiaAPI`（已在 PATH），认证 `/opt/data/.config/mijia-api/auth.json`。`terminal` 改回本地执行，工作目录 `/opt/data/workspace/mijia`。
 - 专用容器 `hermes-mijia-cli`、镜像、SSH 密钥及宿主目录已删除；容器启动预热随之取消，目录缓存缺失或过旧时由 skill 指引刷新。
 - 代价：Agent 的本地 terminal 可接触 Hermes 容器内其他凭据（Spotify 授权、API 密钥等），也能改动 Hermes 配置。用户接受此取舍。
-- `mijia-heater-watch.service` 及其状态、规则已撤销；SOUL.md 与 skill 中“加热类必须安排兜底”“由观察器兜底”的要求已删除。防忘关改由米家自动化处理。
+- `mijia-heater-watch.service` 及其状态、规则已撤销；SOUL.md 与 skill 中“加热类必须安排兜底”“由观察器兜底”的要求已删除。热水器防忘关改由 Hermes 定时任务处理：通电时同时建一次性定时关闭任务（用户确认，2026-10-19），记忆中已有对应条目。
 - 禁用树莓派设备 / 场景的家规校验保留（`/opt/data/tools/mijia/house-policy.json`）。
 - 原生 `no_agent` 脚本与 CLI 同在 Hermes 容器，可直接调用 `/opt/data/.local/bin/mijiaAPI`。以上调整只部署，未做验收。
 
@@ -240,6 +240,11 @@ bridge 只负责音箱交互和与云端协议对接。Hermes 的个人数据、
 - 边界：这是命令文本匹配，防模型误操作，挡不住有意改写；电脑为内置 Administrator 且 UAC 关闭，AgentDock 关掉管理员模式也不会降权。已调研的 AgentDock-Workbench fork 只对自带文件工具做路径限制，受限模式会整体拒绝 shell，不满足“可执行命令但保护文件夹”的需求。
 - `windows-control` skill：音量（每次约 10%）、静音、媒体键、Spotify / Steam / 微信（Weixin）/ QQ 启停、锁屏、关屏、睡眠（本机未启用休眠，现代待机）、关机倒计时（默认 60 秒，可取消）；禁止删改用户文件、装软件、改系统设置。Spotify 播放仍走官方插件，仅在客户端未打开时用 AgentDock 启动。
 - 只部署，未做任何实际调用验收。部署文件见 `deploy/hermes-agentdock/`。
+- 2026-10-19 修正“Spotify 启动后闪退”：AgentDock 会在每条 `exec_command` 结束时结束它派生的进程树，`Start-Process` 启动的 Win32 程序会随之退出（商店应用如记事本不受影响，所以初测没发现）。实测 `Start-Process charmap` 1 秒内被结束，`explorer.exe` 代启动和 WMI 启动不受影响；Spotify 用 `explorer.exe` 启动后 25 秒仍在运行。skill 改为一律用 `explorer.exe "路径"` / `explorer.exe "shell:AppsFolder\<AppID>"` 启动，并限制反复重启。原 skill 备份为 `~/hermes/backups/windows-control-SKILL-20261019-125738.md`。
+  - 音箱实测：模型加载 skill 的一轮用 `explorer.exe` 启动并成功播放；未加载 skill 的一轮仍用 `Start-Process; Start-Sleep 20`，命令结束后 Spotify 被关、播放失败。长期记忆里没有启动方法；bridge 只回传纯文字历史（history=10），不含之前的工具调用。为此在 `agentdock_guard.py` 加硬规则：拦截 `Start-Process` / `start` / `saps`（`-shutdown` 除外），并提示改用 `explorer.exe`。原钩子备份为 `~/hermes/backups/agentdock_guard-20261019-130329.py`。
+  - SOUL.md（profile 与运行两份）增加“必读 skill”硬性规定（米家 → mijia-api，电脑及 Spotify 无设备 → windows-control，天气 → caiyun-weather），新增“电脑（Windows）”一节，Spotify 一节补充“自己的歌单用 spotify_playlists”和“无设备时启动一次客户端”；米家一节去掉已删除的“专用容器”。备份 `~/hermes/backups/SOUL.md.bak-20261019-130836`。
+  - 删除过时记忆“spotify_search 易选中同名歌单……列不出用户的全部歌单”（官方插件已能列出全部歌单），备份 `~/hermes/backups/MEMORY.md.bak-20261019-130534`。
+  - Hermes 对继续中的会话原样复用首轮存下的系统提示词；音箱使用固定 session key，修改 SOUL / 记忆 / skill 后须执行 `hermes sessions repair-prompts <session_id> --apply`（需确认 y）让下一轮重建。已对 `api-9b6575c0b9d50bd5` 执行。
 
 ### 两种定时执行方式
 
@@ -306,7 +311,7 @@ bridge 只负责音箱交互和与云端协议对接。Hermes 的个人数据、
 - 即时播报复用现有米家动作；缺少适合的调用入口时才补专用工具。普通提醒遵守已确认勿扰策略，`urgent` 的例外尚未确定。
 - cron 任务指令必须含设备、动作、时区和必要参数；新会话不能假设看到原对话。确认任务能持久化、取消并在重启后继续执行。
 - 洗澡安排使用已确认的习惯与加热时长，回报具体时间；评测跨天、工作日与时间计算。若时间计算常失败，再补纯时间计算工具。
-- 加热设备打开后可按用户要求安排提醒或关闭任务；手动关闭时取消相关任务。防忘关的硬兜底交给米家自动化（电热毯定时开关；热水器方式待用户选定），Hermes 不再常驻观察器。
+- 加热设备打开后可按用户要求安排提醒或关闭任务；手动关闭时取消相关任务。防忘关：电热毯由米家定时开关；热水器通电时由 Hermes 同时建定时关闭任务。Hermes 不再常驻观察器。
 - 提醒和关闭使用持久化的 cron 任务，不以一次性进程内计时器代替。
 
 ### 授权、数据与 Windows 接口
@@ -350,7 +355,7 @@ Spotify 与米家可按优先级交错实施；每批先验证现有能力，补
 1. 台灯等尚未识别的设备；音箱和热水器身份已核对，实际播报与控制仍待实机验收。
 2. 设备勿扰与工具勿扰策略如何衔接，紧急提醒是否允许例外。
 3. 官方插件的认证迁移方式，以及补收藏 / 编辑歌单等 scope 的授权步骤。
-4. 加热提前量、提醒时间；热水器防忘关的米家自动化方式（开启后延时关闭 / 固定时间关闭）。习惯未知时由用户补充，不预填猜测。
+4. 加热提前量、提醒时间。习惯未知时由用户补充，不预填猜测。
 5. 模型预算、可接受延迟，以及是否需要更强模型或按任务选模型。
 6. 是否为 Windows 增加自定义受保护文件夹规则；是否需要口头确认后放行被拦截的操作。
 

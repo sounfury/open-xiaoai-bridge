@@ -30,7 +30,7 @@ terminal:
 - 虚拟环境基于 Hermes 镜像自带的 Python；镜像升级改变 Python 版本后，需要重建 venv：
   `python3 -m venv --clear /opt/data/tools/mijia/venv && /opt/data/tools/mijia/venv/bin/pip install "mijiaAPI==5.0.0"`
 - 不再有启动预热；目录缓存缺失或过旧时由 skill 指引 Agent 刷新。
-- 加热超时观察器已撤销，热水器 / 电热毯防忘关改由米家自动化处理。
+- 加热超时观察器已撤销。防忘关：电热毯由米家定时开关；热水器通电时由 Hermes 同时建一次性定时关闭任务（cron）。
 
 ## 回退
 
