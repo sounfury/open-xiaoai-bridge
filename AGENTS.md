@@ -188,6 +188,12 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 - 超时：`wakeup.timeout` 秒没开口就退出（播 after_wakeup 告别语）；等待期结束时若已经开口，则继续等待至多 `conversation.max_utterance_s` 秒
 - 后台任务按最新状态切灯，不阻塞语音流程；`set()` 可在 VAD/KWS 线程调用
 
+**原生 ASR（`input_mode == "xiaoai_asr"`）**:
+- **固件连续对话与 bridge 连续对话必须互斥**：OH2P 的 `/data/mipns/dialog_continuous=on` 会使 `mipns` 忽略 `Dialog.Finish`，停留在 `transmitend`，下一轮开麦命令返回 0 却立即关流。`SpeakerManager.native_asr_session()` 在接管期间用 `src:3,event:18` 临时关闭，退出时恢复原设置；备份在音箱 `/tmp/open-xiaoai-bridge-native-asr.previous`，异常重启后的下一次接管沿用它。
+- `pnshelper event_notify {"src":3,"event":6}` 只结束当前采集，**不能单独保证回到 idle**。7/8 是禁用/启用唤醒。开麦后等待 350 ms，结合识别事件和原生聆听灯确认是否启动；没启动时仅重试一次：用 `mibrain text_to_speech save=1` 只合成不播放，借其完整 `Dialog.Finish` 排空遗留状态，清理生成的临时文件。恢复失败明确报错，不当作用户没说话。
+- 开始原生聆听时必须 `_light_state("listening")` 并等待灯效切换完成，停止后台刷新播报灯；原生 ASR 自己控制聆听灯和麦克风音量，bridge 不另开音量 FIFO。
+- INFO 记录开麦结果、麦克风/灯效现场、首个识别事件和完成计数；超时时记录最近的固件 ASR 状态转换，区分无语音和原生识别没有真正启动。
+
 **VAD 状态泄漏陷阱**:
 - VAD 检测循环持续运行，`speech_frames` 会不断积累音频帧
 - 如果 `resume()` 不调用 `_reset_state()`，旧帧（唤醒词回声、TTS 回声）会泄漏到下一轮检测，导致 ASR 识别出幽灵音频

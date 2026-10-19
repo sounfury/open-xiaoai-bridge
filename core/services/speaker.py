@@ -1,5 +1,7 @@
 import asyncio
 import os
+import re
+from contextlib import asynccontextmanager
 from typing import Literal
 
 import open_xiaoai_server
@@ -21,6 +23,8 @@ class SpeakerManager:
 
     def __init__(self):
         set_speaker(self)
+        # 原生 ASR 接管只在 MainApp.loop 使用，防止旧会话恢复设置覆盖新会话。
+        self._native_asr_lock = asyncio.Lock()
 
     async def get_playing(self, sync=False):
         """获取播放状态"""
@@ -140,13 +144,91 @@ class SpeakerManager:
             else:
                 command = 'ubus call pnshelper event_notify \'{"src":0,"event":0}\''
         else:
-            command = """
-                ubus call pnshelper event_notify '{"src":3, "event":7}'
-                sleep 0.1
-                ubus call pnshelper event_notify '{"src":3, "event":8}'
-            """
+            # event 6 结束当前采集，但不能保证清除 transmitend。
+            # 原生 ASR 接管还必须关闭固件连续对话，否则 Dialog.Finish 会被忽略。
+            command = 'ubus -t 2 call pnshelper event_notify \'{"src":3,"event":6}\''
         res = await self.run_shell(command)
-        return '"code": 0' in res.stdout
+        data = json_decode(res.stdout) if res else None
+        ok = bool(res and res.exit_code == 0 and isinstance(data, dict) and data.get("code") == 0)
+        if not ok:
+            logger.warning(
+                f"原生{'唤醒' if awake else '停止会话'}失败: "
+                f"exit={getattr(res, 'exit_code', None)}, stdout={getattr(res, 'stdout', '')[:200]}",
+                module="Speaker",
+            )
+        return ok
+
+    @asynccontextmanager
+    async def native_asr_session(self):
+        """接管期间禁用固件连续对话；退出时恢复原设置，异常退出的备份供下次沿用。"""
+        async with self._native_asr_lock:
+            saved = "/tmp/open-xiaoai-bridge-native-asr.previous"
+            setting = "/data/mipns/dialog_continuous"
+            try:
+                result = await self.run_shell(
+                    f"test -f {saved} || cp -p {setting} {saved}; "
+                    f"test -f {saved} || exit 1; "
+                    "ubus -t 2 call pnshelper event_notify '{\"src\":3,\"event\":18}' >/dev/null; "
+                    f"cat {setting}",
+                    timeout=3000,
+                )
+                if result is None or result.exit_code != 0 or result.stdout.strip() != "off":
+                    raise RuntimeError("无法关闭固件连续对话，原生 ASR 接管未启动")
+                logger.info("原生 ASR 接管：暂时关闭固件连续对话", module="Speaker")
+                yield
+            finally:
+                # 使用原文件内容恢复，也兼容 combin_on/off；用户在会话中改变设置则保留。
+                result = await self.run_shell(
+                    f"if [ -f {saved} ]; then "
+                    f'if [ "$(cat {setting})" = off ]; then cat {saved} > {setting} || exit 1; fi; '
+                    f"rm -f {saved}; fi; cat {setting}",
+                    timeout=3000,
+                )
+                if result is not None and result.exit_code == 0:
+                    logger.info(f"原生 ASR 接管结束：固件连续对话={result.stdout.strip()}", module="Speaker")
+                else:
+                    logger.warning("恢复固件连续对话失败，音箱保留备份供下次恢复", module="Speaker")
+
+    async def native_asr_is_listening(self) -> bool:
+        """检查固件是否仍显示聆听灯；结合识别事件判断，不能只信开麦命令返回值。"""
+        result = await self.run_shell("ubus -t 1 call led status", timeout=1500)
+        return bool(result and result.exit_code == 0 and re.search(r"current id 41\b", result.stdout))
+
+    async def recover_native_asr(self) -> bool:
+        """排空遗留 transmitend：仅合成不播放，让固件收到一次完整 Dialog.Finish。"""
+        # 只有原生连续对话已关闭时才可调用；不重启 mico_aivs_lab，不影响事件桥接。
+        result = await self.run_shell(
+            "ubus -t 5 call mibrain text_to_speech '{\"text\":\"嗯\",\"save\":1}'",
+            timeout=6000,
+        )
+        data = json_decode(result.stdout) if result else None
+        if not isinstance(data, dict) or data.get("code") != 0:
+            return False
+        info = json_decode(data.get("info", ""))
+        path = info.get("path", "") if isinstance(info, dict) else ""
+        # 只清理此次生成的固件 TTS 文件。
+        if re.fullmatch(r"/tmp/tts/[\w.-]+\.mp3", path):
+            await self.run_shell(f"rm -f '{path}'", timeout=1500)
+        await asyncio.sleep(0.15)
+        return True
+
+    async def native_asr_status(self, recent: bool = False) -> str:
+        """原生识别诊断：麦克风标记、唤醒标记、当前灯效及最近的状态转换。"""
+        command = (
+            "printf 'native_continuous='; cat /data/mipns/dialog_continuous; echo; "
+            "if [ -f /tmp/mipns/mute ]; then echo native_mic=off; else echo native_mic=on; fi; "
+            "if [ -f /tmp/mipns/player_wakeup ]; then echo player_wakeup=1; else echo player_wakeup=0; fi; "
+            "ubus -t 1 call led status"
+        )
+        if recent:
+            command += (
+                "; tail -n 120 /tmp/log/messages | grep -E "
+                "'local mic on|local stream inflowed|transmitend|asrstart|asrend|stop session' || true"
+            )
+        res = await self.run_shell(command, timeout=2000)
+        if res is None or res.exit_code != 0:
+            return f"状态读取失败(exit={getattr(res, 'exit_code', None)})"
+        return " ".join(res.stdout.split())[:1800]
 
     async def ask_xiaoai(self, text: str, silent=False):
         """

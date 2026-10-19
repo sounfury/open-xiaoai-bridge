@@ -31,6 +31,7 @@ Key design decisions:
 
 import asyncio
 import os
+import time
 
 import open_xiaoai_server
 
@@ -179,6 +180,7 @@ class ExternalConversationController:
         self._vad_future: asyncio.Future | None = None
         # Per-session asyncio.Future used to receive XiaoAI native ASR results
         self._xiaoai_asr_future: asyncio.Future | None = None
+        self._native_asr_stats: dict = {}
         self._loop: asyncio.AbstractEventLoop | None = None
         # Playback token for the current TTS session
         self._playback_token: int | None = None
@@ -264,7 +266,11 @@ class ExternalConversationController:
         TurnTimer.mark("进入对话")
 
         try:
-            await self._conversation_loop()
+            if self.uses_xiaoai_asr():
+                async with get_speaker().native_asr_session():
+                    await self._conversation_loop()
+            else:
+                await self._conversation_loop()
         except Exception as exc:
             import traceback
             logger.error(
@@ -285,6 +291,7 @@ class ExternalConversationController:
         if not self.active:
             return
         self.active = False
+        native_waiting = self._xiaoai_asr_future is not None
         self._cancel_vad_future()
         self._cancel_xiaoai_asr_future()
         kws = get_kws()
@@ -295,7 +302,8 @@ class ExternalConversationController:
         if self._playback_token is not None:
             open_xiaoai_server.stop_tts_playback(self._playback_token)
             self._playback_token = None
-        if self.uses_xiaoai_asr():
+        if self.uses_xiaoai_asr() and native_waiting:
+            # 正常退出时主循环已经停止原生聆听；只在中途 stop 时补清理，避免重复关掉后来的聆听。
             speaker = get_speaker()
             if speaker and self._loop:
                 try:
@@ -340,7 +348,17 @@ class ExternalConversationController:
             return False
 
         normalized_text = text.strip() if isinstance(text, str) else ""
+        stats = self._native_asr_stats
+        stats["events"] = stats.get("events", 0) + 1
+        elapsed = time.monotonic() - stats.get("started", time.monotonic())
+        if stats["events"] == 1:
+            logger.info(
+                f"原生 ASR 首个事件: +{elapsed:.2f}s, dialog={dialog_id}, "
+                f"final={is_final}, vad_begin={is_vad_begin}, text_len={len(normalized_text)}",
+                module=self.LOG_MODULE,
+            )
         if not is_final:
+            stats["partials"] = stats.get("partials", 0) + 1
             logger.debug(
                 f"Ignoring partial XiaoAI ASR result: {normalized_text}",
                 module=self.LOG_MODULE,
@@ -352,13 +370,19 @@ class ExternalConversationController:
             logger.debug("Ignoring XiaoAI wake marker for native ASR", module=self.LOG_MODULE)
             return True
 
+        stats["finals"] = stats.get("finals", 0) + 1
         if normalized_text:
+            logger.info(
+                f"原生 ASR 完成: {elapsed:.2f}s, events={stats['events']}, "
+                f"partials={stats.get('partials', 0)}, dialog={dialog_id}, text_len={len(normalized_text)}",
+                module=self.LOG_MODULE,
+            )
             logger.debug(f"XiaoAI native ASR recognized: {normalized_text}", module=self.LOG_MODULE)
             self._resolve_xiaoai_asr_future(normalized_text)
             return True
 
-        logger.debug(
-            "XiaoAI native ASR received empty final result",
+        logger.info(
+            f"原生 ASR 空结果: +{elapsed:.2f}s, dialog={dialog_id}, vad_begin={is_vad_begin}",
             module=self.LOG_MODULE,
         )
         self._resolve_xiaoai_asr_future(self.XIAOAI_ASR_TIMEOUT)
@@ -835,40 +859,73 @@ class ExternalConversationController:
         self._vad_future = None
 
     async def _wait_for_xiaoai_asr_text(self) -> str | None:
-        """Wake XiaoAI and wait for a final native ASR result."""
+        """清理旧的原生会话后静默开麦，并记录实际识别事件及超时现场。"""
         speaker = get_speaker()
         if not speaker:
             logger.error("Speaker not available", module=self.LOG_MODULE)
             return None
 
+        # 退出 speaking 后停止后台补亮播报灯；聆听灯和麦克风音量由原生 ASR 接管。
+        self._light_state("listening")
+        if self._light is not None:
+            await self._light.settle()
         deadline = self._loop.time() + self.timeout
+        attempt = 0
+        recovered = False
         while self.active:
-            remaining = deadline - self._loop.time()
-            if remaining <= 0:
-                logger.info("XiaoAI native ASR hit outer wait timeout", module=self.LOG_MODULE)
+            if self._loop.time() >= deadline:
                 return None
-
-            self._xiaoai_asr_future = self._loop.create_future()
+            attempt += 1
+            self._native_asr_stats = {"started": time.monotonic(), "events": 0, "partials": 0, "finals": 0}
             try:
-                wait_seconds = max(0.1, remaining)
-                logger.debug(
-                    f"Triggering XiaoAI native ASR, waiting up to {wait_seconds:.1f}s",
+                # event 6 只结束采集；固件连续对话由 native_asr_session 暂时关闭。
+                reset_ok = await speaker.wake_up(awake=False)
+                if not reset_ok:
+                    logger.warning("原生 ASR 清理旧会话失败，本轮停止", module=self.LOG_MODULE)
+                    return None
+                await asyncio.sleep(0.15)
+                if not self.active:
+                    return None
+                self._xiaoai_asr_future = self._loop.create_future()
+                wake_ok = await speaker.wake_up(awake=True, silent=True)
+                logger.info(
+                    f"原生 ASR 开始聆听: attempt={attempt}, reset={reset_ok}, wake={wake_ok}, "
+                    f"light={self._light.state if self._light else 'disabled'}",
                     module=self.LOG_MODULE,
                 )
-                await speaker.wake_up(awake=True, silent=True)
-                result = await asyncio.wait_for(
-                    self._xiaoai_asr_future,
-                    timeout=wait_seconds,
+                if not wake_ok:
+                    raise RuntimeError("原生 ASR 开麦命令失败")
+                # ubus 返回成功不等于开始识别：故障时 asrstart 后约 100ms 就 asrend。
+                # 等待期间 Future 已接收事件，不会丢掉紧跟应答语说出的句子。
+                await asyncio.sleep(0.35)
+                listening = await speaker.native_asr_is_listening()
+                logger.info(
+                    f"原生 ASR 开麦确认: listening={listening}, events={self._native_asr_stats['events']}; "
+                    f"{await speaker.native_asr_status()}", module=self.LOG_MODULE,
                 )
+                if not listening and not self._native_asr_stats["events"]:
+                    if recovered:
+                        raise RuntimeError("原生 ASR 恢复后仍未开始聆听")
+                    logger.warning("原生 ASR 未启动，排空旧会话后重试一次", module=self.LOG_MODULE)
+                    recovered = True
+                    self._cancel_xiaoai_asr_future()
+                    if not await speaker.recover_native_asr():
+                        raise RuntimeError("原生 ASR 旧会话恢复失败")
+                    continue
+                remaining = deadline - self._loop.time()
+                result = await asyncio.wait_for(self._xiaoai_asr_future, timeout=max(0.01, remaining))
                 if result == self.XIAOAI_ASR_TIMEOUT:
-                    logger.debug(
-                        "XiaoAI native ASR ended without speech (native timeout), retrying",
-                        module=self.LOG_MODULE,
-                    )
+                    logger.info("原生 ASR 本次无有效语音，在本轮剩余时间内重新开麦", module=self.LOG_MODULE)
                     continue
                 return result
             except asyncio.TimeoutError:
-                logger.info("XiaoAI native ASR hit outer wait timeout", module=self.LOG_MODULE)
+                stats = self._native_asr_stats
+                logger.warning(
+                    f"原生 ASR 等待超时: events={stats.get('events', 0)}, "
+                    f"partials={stats.get('partials', 0)}, finals={stats.get('finals', 0)}; "
+                    f"{await speaker.native_asr_status(recent=True)}",
+                    module=self.LOG_MODULE,
+                )
                 return None
             finally:
                 self._xiaoai_asr_future = None
@@ -877,8 +934,14 @@ class ExternalConversationController:
 
     def _resolve_xiaoai_asr_future(self, text: str):
         """Resolve the pending XiaoAI ASR future on the owner loop."""
-        if self._xiaoai_asr_future and not self._xiaoai_asr_future.done():
-            self._loop.call_soon_threadsafe(self._xiaoai_asr_future.set_result, text)
+        future = self._xiaoai_asr_future
+        if future is not None:
+            def resolve():
+                # 回调在线程桥接循环里到达；到主循环执行时可能已超时或被 stop 取消。
+                if self._xiaoai_asr_future is future and not future.done():
+                    future.set_result(text)
+
+            self._loop.call_soon_threadsafe(resolve)
 
     def _cancel_xiaoai_asr_future(self):
         """Cancel any pending XiaoAI ASR future."""

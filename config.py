@@ -378,7 +378,7 @@ APP_CONFIG = {
         # 输入模式：
         #   - "local_asr": 使用本地 VAD + SherpaASR
         #   - "xiaoai_asr": 接管小爱原生 ASR 结果
-        "input_mode": "local_asr",
+        "input_mode": "xiaoai_asr",
         # session_key 统一采用 agent:<agentId>:<rest> 格式，便于 after_wakeup 解析
         "session_key": "agent:default:open-xiaoai-bridge",
         # 可选：把 session_key 作为请求头发给服务端，用于服务端长期记忆作用域。

@@ -112,6 +112,10 @@ class ConversationLight:
         elif self._loop.is_running():
             self._loop.call_soon_threadsafe(self._set, state)
 
+    async def settle(self, timeout: float = 2.0):
+        """等当前灯效切换完成，之后可把灯的控制权交还原生 ASR。"""
+        await asyncio.wait_for(self._wait_idle(), timeout)
+
     async def close(self, timeout: float = 3.0):
         """熄灯并结束后台任务（最多等 timeout 秒）。"""
         self._set("off")
@@ -224,6 +228,9 @@ class ConversationLight:
             logger.warning(f"灯效 {label} 失败: {exc}", module=LOG_MODULE)
             return
         if result is not None and getattr(result, "exit_code", 0) == 0:
-            logger.debug(f"灯效 {label}", module=LOG_MODULE)
+            if quiet:
+                logger.debug(f"灯效 {label}", module=LOG_MODULE)
+            else:
+                logger.info(f"灯效 {label}（状态 {self._desired}）", module=LOG_MODULE)
         elif not quiet:
             logger.warning(f"灯效 {label} 失败，继续语音流程", module=LOG_MODULE)
