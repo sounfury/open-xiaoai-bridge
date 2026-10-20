@@ -1,0 +1,21 @@
+{
+  "blocked_devices": [
+    {
+      "did": "674635403",
+      "reason": "卧室树莓派在老家，禁止控制",
+      "names": [
+        "卧室树莓派",
+        "树莓派"
+      ]
+    }
+  ],
+  "blocked_scenes": [
+    "关闭树莓派",
+    "树莓派开机"
+  ],
+  "default_speaker": {
+    "did": "2181631827",
+    "name": "Xiaomi 智能音箱 Pro",
+    "reason": "当前语音入口 OH2P；未指定音箱时播报用它"
+  }
+}

@@ -53,6 +53,9 @@ def install() -> None:
             sid = str(scene.get('scene_id') or scene.get('id'))
             if str(scene_id) == sid and scene.get('name') in blocked_scenes:
                 raise PermissionError('[MijiaPolicy] 该场景已被用户禁止运行')
+            # 场景名不在黑名单、但实际会操作禁用设备（如回家 / 离家 / 晚安会开关树莓派插座）也拒绝
+            if str(scene_id) == sid and has_blocked_did(scene.get('scene_action'), blocked):
+                raise PermissionError('[MijiaPolicy] 该场景会操作被禁止控制的设备')
         return original_scene(self, scene_id, home_id, *args, **kwargs)
 
     mijiaAPI._request = guarded_request

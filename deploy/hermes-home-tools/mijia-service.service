@@ -1,0 +1,24 @@
+[Unit]
+Description=Mijia control service for Hermes home_tools MCP (127.0.0.1:9393)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+Environment=TZ=Asia/Shanghai
+# 与 Hermes 容器内 mijiaAPI CLI 共用同一份认证和家规
+Environment=MIJIA_AUTH=/home/ubuntu/hermes/data/.config/mijia-api/auth.json
+Environment=MIJIA_POLICY=/home/ubuntu/hermes/data/tools/mijia/house-policy.json
+WorkingDirectory=/home/ubuntu/home-tools/mijia/service
+ExecStart=/home/ubuntu/home-tools/mijia/.venv/bin/python server.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/ubuntu/home-tools/mijia/service /home/ubuntu/hermes/data/.config/mijia-api
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

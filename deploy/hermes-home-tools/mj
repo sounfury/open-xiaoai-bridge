@@ -1,0 +1,10 @@
+#!/bin/bash
+# 调试用：mj health | devices | refresh | get|set|action|scene|speak '<json>'
+# 例：mj get '{"devices":["厕所灯"]}'   mj set '{"device":"厕所灯","prop":"on","value":true,"dry_run":true}'
+U=http://127.0.0.1:9393
+case "$1" in
+ health) curl -s $U/health;;
+ devices|refresh) curl -s -XPOST $U/$1 -d "${2:-{\}}";;
+ get|set|action|scene|speak) curl -s -XPOST $U/$1 -d "$2";;
+ *) echo "usage: mj health|devices|refresh|get|set|action|scene|speak '<json>'";;
+esac; echo

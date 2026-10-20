@@ -8,7 +8,7 @@
 |---|---|
 | `/opt/data/tools/mijia/venv` | 上游 `mijiaAPI==5.0.0` 独立虚拟环境 |
 | `/opt/data/.local/bin/mijiaAPI` | 入口（`mijia_cli.py`），已在 hermes 用户 PATH 中 |
-| `/opt/data/tools/mijia/mijia_house_policy.py`、`house-policy.json` | 禁用设备 / 场景检查（老家树莓派） |
+| `/opt/data/tools/mijia/mijia_house_policy.py`、`house-policy.json` | 禁用设备 / 场景检查（老家树莓派）；会操作禁用设备的场景（回家 / 离家 / 晚安）也拒绝。与宿主 `mijia-service`（[home_tools MCP](../hermes-home-tools/README.md)）共用 |
 | `/opt/data/tools/mijia/warm_catalog.py` | 刷新设备目录到 `/opt/data/workspace/mijia/devices.txt`，失败保留旧快照 |
 | `/opt/data/.config/mijia-api/auth.json` | 米家认证（复制自原登录，0600） |
 | `skills/mijia-api/SKILL.md` | 源配置与运行配置各一份 |
