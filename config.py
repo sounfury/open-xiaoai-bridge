@@ -70,7 +70,10 @@ async def after_wakeup(speaker, source=None, session_key=None):
         可据此区分是哪个 Agent 退出，例如播放不同的退出提示语
     """
     if source == "openai":
-        await speaker.play(text="再见")
+        # 用 openai 后端配置的 TTS（openai.tts_provider），和对话回复同一个声音；TTS 不可用时自动回退小爱原生
+        from core.openai import OpenAIManager
+
+        await OpenAIManager._play_response_with_tts("再见")
 
 
 APP_CONFIG = {
@@ -162,7 +165,7 @@ APP_CONFIG = {
         # 流式回复怎么切段（openai.stream=True 时）：第一段尽快播，后面攒长一点少停顿
         "reply_segments": {
             "first_min_chars": 8,  # 第一段在句号处就出；在逗号处切需要至少这么多字
-            "target_chars": 60,  # 后面的段攒到这么多字，在标点处切
+            "target_chars": 30,  # 后面的段攒到这么多字，在标点处切（本机 GPT-SoVITS：第 2 段短一点，第 1 段播完时它已合成好；原 60）
             "max_chars": 120,  # 一段最长
             "flush_delay_ms": 250,  # 流停住这么久，已经完整的句子先播
             "stall_force_ms": 1200,  # 流停住这么久，没有标点也先播
@@ -313,7 +316,20 @@ APP_CONFIG = {
             "default_speaker": "zh_female_vv_uranus_bigtts",  # 音色 https://www.volcengine.com/docs/6561/1257544?lang=zh
             "audio_format": "pcm",  # 推荐默认值：局域网稳定环境下首音更快、播放更顺
             "stream": True,  # 推荐默认值：边合成边播放，首音延迟更低
-        }
+        },
+        # 本机 GPT-SoVITS 井芹仁菜 v2 微调模型（E:\ai\kato\start_tts_server.bat 启动，OpenAI 兼容接口）
+        # 服务不可用时 TTSRouter 会自动回退小爱原生 TTS
+        "openai": {
+            "base_url": "http://127.0.0.1:9881/v1",
+            "api_key": "",
+            "model": "gpt-sovits-nina-v2",
+            "voice": "nina",  # 见 E:\ai\kato\server\voices.json（nina / nina2 = 两条参考音频；其它角色备份在 voices.kato.json / voices.yamada.json）
+            "response_format": "wav",
+            "speed": 1.0,
+            "timeout": 60,
+            # 服务端用多相滤波直接输出 24k，避免 Bridge 线性插值重采样带来的混叠
+            "extra_body": {"sample_rate": 24000},
+        },
     },
     # OpenClaw Configuration
     "openclaw": {
@@ -407,6 +423,7 @@ APP_CONFIG = {
         # 回复里调用了这些工具（放 / 切 / 暂停音乐）就在回答完结束对话，不再接着听：对话中途才放的歌没被压低，
         # 接着听会把歌声当成你在说话，对话结束不了（OwnDing 和原生小爱放歌后也是直接结束）。[] = 关闭
         "end_after_tools": ["spotify_playback"],
+        "tts_provider": "xiaoai",  # 小爱原生；改成 "openai" 用 tts.openai（本机 GPT-SoVITS 井芹仁菜音色，占约 3G 显存，需先启动服务）
         "tts_speed": 1.0,
         "tts_speaker": "xiaoai",
         "session_tts_speakers": {},

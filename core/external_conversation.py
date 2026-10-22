@@ -42,6 +42,7 @@ from core.services.conversation_light import ConversationLight, effects_from_con
 from core.services.tts.segment_player import (
     CallbackSegmentPlayer,
     NativeTTSSettings,
+    PrefetchSegmentPlayer,
     SegmentPlayer,
     XiaoAINativeSegmentPlayer,
 )
@@ -1083,7 +1084,7 @@ class ExternalConversationController:
             await self._play_tts(reply)
 
     def _new_segment_player(self, on_start=None) -> SegmentPlayer:
-        """小爱原生 TTS 用预生成流水线；其他 TTS 按段依次播。"""
+        """小爱原生 TTS 用预生成流水线；OpenAI 兼容 / MLX-Audio 提前合成后面的段；其他 TTS 按段依次播。"""
         from core.services.tts.router import TTSRouter
 
         def on_play_start():
@@ -1104,6 +1105,33 @@ class ExternalConversationController:
             return XiaoAINativeSegmentPlayer(
                 speaker,
                 NativeTTSSettings.from_config(self._conv_cfg("native_tts", {})),
+                on_play_start=on_play_start,
+                on_idle=on_idle,
+            )
+        if provider in TTSRouter.PREFETCHABLE_PROVIDERS:
+            tts_speaker = self.backend.get_tts_speaker_for_session_key()
+
+            async def synth(text: str):
+                return await TTSRouter.synthesize_openai_compatible(
+                    text, provider=provider, tts_speaker=tts_speaker
+                )
+
+            async def play(result):
+                audio, audio_format = result
+                self._playback_token = open_xiaoai_server.begin_playback_session()
+                try:
+                    await TTSRouter.play_audio_bytes(audio, audio_format, provider=provider)
+                finally:
+                    self._playback_token = None
+
+            async def fallback(text: str):
+                await TTSRouter._fallback_to_xiaoai(text, log_prefix=self.LOG_MODULE)
+
+            return PrefetchSegmentPlayer(
+                synth,
+                play,
+                fallback_fn=fallback,
+                prefetch=self._conv_cfg("native_tts", {}).get("prefetch_segments", 2),
                 on_play_start=on_play_start,
                 on_idle=on_idle,
             )

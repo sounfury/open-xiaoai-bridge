@@ -17,6 +17,8 @@ class TTSRouter:
 
     XIAOAI_TTS_SPEAKER = "xiaoai"
     SUPPORTED_PROVIDERS = frozenset(("xiaoai", "doubao", "openai", "mlx_audio"))
+    # 先整段合成成音频文件再播放的 provider：分段播放时可以提前合成后面的段
+    PREFETCHABLE_PROVIDERS = frozenset(("openai", "mlx_audio"))
 
     @classmethod
     def resolve_provider(
@@ -129,6 +131,12 @@ class TTSRouter:
                 playback_token=playback_token,
             )
 
+    @staticmethod
+    def _openai_compatible_names(provider: str) -> tuple[type[OpenAITTS], str, str, str]:
+        if provider == "mlx_audio":
+            return MLXAudioTTS, "tts.mlx_audio", "MLX-Audio", "mlx_audio_tts_"
+        return OpenAITTS, "tts.openai", "OpenAI", "openai_tts_"
+
     @classmethod
     async def _play_openai_compatible(
         cls,
@@ -137,17 +145,21 @@ class TTSRouter:
         provider: str,
         tts_speaker: str | None,
     ) -> None:
-        if provider == "mlx_audio":
-            tts_class = MLXAudioTTS
-            config_key = "tts.mlx_audio"
-            log_name = "MLX-Audio"
-            file_prefix = "mlx_audio_tts_"
-        else:
-            tts_class = OpenAITTS
-            config_key = "tts.openai"
-            log_name = "OpenAI"
-            file_prefix = "openai_tts_"
+        audio, audio_format = await cls.synthesize_openai_compatible(
+            text, provider=provider, tts_speaker=tts_speaker
+        )
+        await cls.play_audio_bytes(audio, audio_format, provider=provider)
 
+    @classmethod
+    async def synthesize_openai_compatible(
+        cls,
+        text: str,
+        *,
+        provider: str,
+        tts_speaker: str | None,
+    ) -> tuple[bytes, str]:
+        """只合成不播放，返回 (音频字节, 文件格式)。"""
+        tts_class, config_key, log_name, _ = cls._openai_compatible_names(provider)
         tts_config = ConfigManager.instance().get_app_config(config_key, {})
         voice_override = (
             tts_speaker
@@ -167,14 +179,27 @@ class TTSRouter:
                 "the Bridge playback decoder; use mp3, flac, wav, ogg, or pcm"
             )
 
+        audio = await tts.synthesize(text)
+        safe_format = "".join(
+            character
+            for character in tts.response_format.lower()
+            if character.isalnum()
+        ) or "wav"
+        return audio, safe_format
+
+    @classmethod
+    async def play_audio_bytes(
+        cls,
+        audio: bytes,
+        audio_format: str,
+        *,
+        provider: str,
+    ) -> None:
+        """把合成好的音频写成临时文件，通过 Rust 管线推到音箱播放（播完才返回）。"""
+        _, _, log_name, file_prefix = cls._openai_compatible_names(provider)
+        safe_format = audio_format
         temporary_path: str | None = None
         try:
-            audio = await tts.synthesize(text)
-            safe_format = "".join(
-                character
-                for character in tts.response_format.lower()
-                if character.isalnum()
-            ) or "wav"
             with tempfile.NamedTemporaryFile(
                 prefix=file_prefix,
                 suffix=f".{safe_format}",

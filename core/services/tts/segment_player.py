@@ -3,7 +3,9 @@
 - XiaoAINativeSegmentPlayer：小爱原生 TTS。用 `ubus call mibrain text_to_speech save=1` 把每段提前
   生成成音频文件，再依次 `miplayer -f` 播放（移植自 OwnDing/open-xiaoai 的 NativeXiaomiTTS）。
   播放第 n 段时第 n+1、n+2 段已经在生成，段间几乎没有等待。
-- CallbackSegmentPlayer：其他 TTS（豆包 / OpenAI 兼容等），按段依次调用播放函数，不预生成。
+- PrefetchSegmentPlayer：先整段合成再播放的 TTS（OpenAI 兼容 / MLX-Audio，例如本机 GPT-SoVITS）。
+  合成和播放拆成两条流水线：播放第 n 段时，后面最多 prefetch 段已经按顺序在合成。
+- CallbackSegmentPlayer：其他 TTS（豆包等），按段依次调用播放函数，不预生成。
 
 用法：start() → add(text) ... → finish()（等全部播完）；打断时 abort()。
 """
@@ -118,6 +120,108 @@ class CallbackSegmentPlayer(SegmentPlayer):
                 logger.error(f"Segment playback failed: {type(exc).__name__}: {exc}", module=_MODULE)
             if self._queue.empty():
                 self._notify_idle()
+
+
+class PrefetchSegmentPlayer(SegmentPlayer):
+    """合成 / 播放分开跑：播第 n 段时第 n+1 段起已经在合成，段间不用等合成。
+
+    synth_fn(text) -> 合成结果（任意对象，交给 play_fn）；按 add 的顺序一次只合成一段
+    （本地 GPU 服务本来也是串行的），最多领先播放 prefetch 段。
+    play_fn(result)：播放一段，播完才返回。
+    fallback_fn(text)：某段合成失败时用它播这段（例如小爱原生 TTS），不设置则跳过这段。
+    """
+
+    def __init__(
+        self,
+        synth_fn: Callable[[str], Awaitable[object]],
+        play_fn: Callable[[object], Awaitable[None]],
+        fallback_fn: Callable[[str], Awaitable[None]] | None = None,
+        prefetch: int = 2,
+        on_play_start=None,
+        on_idle=None,
+    ):
+        super().__init__(on_play_start, on_idle)
+        self._synth_fn = synth_fn
+        self._play_fn = play_fn
+        self._fallback_fn = fallback_fn
+        self._prefetch = max(1, int(prefetch))
+        self._texts: asyncio.Queue | None = None
+        self._ready: asyncio.Queue | None = None
+        self._synth_worker: asyncio.Task | None = None
+        self._play_worker: asyncio.Task | None = None
+        self._synthesizing = False
+        self._aborted = False
+
+    async def start(self):
+        self._texts = asyncio.Queue()
+        self._ready = asyncio.Queue(maxsize=self._prefetch)
+        self._aborted = False
+        self._synth_worker = asyncio.create_task(self._run_synth())
+        self._play_worker = asyncio.create_task(self._run_play())
+
+    async def add(self, text: str):
+        if self._texts is None or self._aborted:
+            return
+        self.added += 1
+        await self._texts.put(text)
+
+    async def finish(self) -> bool:
+        if self._texts is None:
+            return False
+        await self._texts.put(None)
+        await asyncio.gather(self._play_worker, return_exceptions=True)
+        return not self._aborted
+
+    async def abort(self):
+        self._aborted = True
+        workers = [w for w in (self._synth_worker, self._play_worker) if w and not w.done()]
+        for worker in workers:
+            worker.cancel()
+        if workers:
+            await asyncio.gather(*workers, return_exceptions=True)
+
+    async def _run_synth(self):
+        while True:
+            text = await self._texts.get()
+            if text is None:
+                await self._ready.put(None)
+                return
+            self._synthesizing = True
+            try:
+                result: object = await self._synth_fn(text)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                result = exc
+            finally:
+                self._synthesizing = False
+            await self._ready.put((text, result))  # 领先 prefetch 段时在这里等
+
+    async def _run_play(self):
+        while True:
+            item = await self._ready.get()
+            if item is None:
+                return
+            text, result = item
+            self._notify_play_start()
+            try:
+                if isinstance(result, Exception):
+                    self.error = f"{type(result).__name__}: {result}"
+                    logger.error(f"Segment synthesis failed: {self.error}", module=_MODULE)
+                    if self._fallback_fn is None:
+                        continue
+                    await self._fallback_fn(text)
+                else:
+                    await self._play_fn(result)
+                self.played += 1
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.error = str(exc)
+                logger.error(f"Segment playback failed: {type(exc).__name__}: {exc}", module=_MODULE)
+            finally:
+                if self._ready.empty() and self._texts.empty() and not self._synthesizing:
+                    self._notify_idle()
 
 
 @dataclass
