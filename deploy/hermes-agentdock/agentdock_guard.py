@@ -5,7 +5,8 @@
 它防的是模型误操作，不是对任意 shell 的安全隔离。
 
 另外拦截 Start-Process / start 启动程序：AgentDock 会在命令结束时结束它派生的进程树，
-这样启动的程序会马上被关掉（Spotify "闪退"）。要求改用 explorer.exe 启动。
+这样启动的程序会马上被关掉（Spotify "闪退"）。要求改用 windows-control 的启动模板。
+以及立即关机的写法（Win32Shutdown / Stop-Computer / Restart-Computer）：关机只能用可取消的 shutdown.exe 倒计时。
 """
 import json
 import re
@@ -27,8 +28,18 @@ if START_PROCESS.search(command) and not re.search(r'(?i)-shutdown\b', command):
     print(json.dumps({
         'action': 'block',
         'message': '[AgentDockGuard] 不要用 Start-Process / start 启动程序：AgentDock 会在命令结束时'
-                   '把它启动的程序一起关掉。改用 explorer.exe "完整路径"（开始菜单程序用 '
-                   'explorer.exe "shell:AppsFolder\\<AppID>"），先 skill_view windows-control 查看常用路径。',
+                   '把它启动的程序一起关掉。先 skill_view windows-control，用里面的启动模板'
+                   '（会设置工作目录并读回程序是否在运行）。',
+    }, ensure_ascii=False))
+    sys.exit(2)
+
+IMMEDIATE_SHUTDOWN = re.compile(r'(?i)win32shutdown|stop-computer|restart-computer')
+SHUTDOWN_NOW = re.compile(r'(?i)\bshutdown(?:\.exe)?\b(?=[^;\n|]*[/-][srpg]\b)(?![^;\n|]*[/-]t\s+[1-9])')
+if IMMEDIATE_SHUTDOWN.search(command) or SHUTDOWN_NOW.search(command):
+    print(json.dumps({
+        'action': 'block',
+        'message': '[AgentDockGuard] 关机 / 重启只能用可取消的倒计时：shutdown.exe /s /t 60（重启用 /r）。'
+                   '它报错时把错误告诉用户，不要换成立即关机的写法。',
     }, ensure_ascii=False))
     sys.exit(2)
 

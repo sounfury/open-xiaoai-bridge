@@ -192,8 +192,9 @@ bridge 只负责音箱交互和协议对接；Hermes 的数据、工具和任务
 
 - 复用用户电脑上的 AgentDock（登录后自启，运行在当前桌面会话，经 Cloudflare 隧道接入）。Hermes 只开放 `exec_command`，文件、浏览器、管理类工具不可见；令牌在 Hermes `.env`。
 - 能力（`windows-control` skill）：音量（每次约 10%）、静音、媒体键、Spotify / Steam / 微信 / QQ 启停、锁屏、关屏、睡眠、可取消的关机倒计时（默认 60 秒）。禁止删改用户文件、装软件、改系统设置。
-- 启动程序一律用 `explorer.exe "路径"` 或 `explorer.exe "shell:AppsFolder\<AppID>"`：AgentDock 在每条命令结束时会结束它派生的进程树，`Start-Process` 启动的 Win32 程序会跟着退出。
-- 拦截：`pre_tool_call` 钩子 `agentdock_guard.py` 复用 Hermes 的危险命令规则（递归 / 强制删除、格式化、编码命令、`taskkill /f` 等），另拦截 `Start-Process` / `start` / `saps`（`-shutdown` 除外）；命中或钩子出错都拦截。被拦截时按提示改正，需要用户本人操作的就告诉用户，不换写法绕过。
+- 普通 exe 用 skill 里的启动模板（WMI `Win32_Process.Create`，工作目录设为 exe 所在文件夹，3 秒后读回进程和崩溃记录），商店应用用 `explorer.exe "shell:AppsFolder\<AppID>"`。AgentDock 在每条命令结束时会结束它派生的进程树，`Start-Process` 启动的 Win32 程序会跟着退出；`explorer.exe "xx.exe"` 的工作目录是 system32，按相对路径读数据的游戏会崩。
+- 改变电脑状态的操作在同一条命令末尾读回结果，按读回回答；`exit_code: 0` 或 `status: running` 不算办成。
+- 拦截：`pre_tool_call` 钩子 `agentdock_guard.py` 复用 Hermes 的危险命令规则（递归 / 强制删除、格式化、编码命令、`taskkill /f` 等），另拦截 `Start-Process` / `start` / `saps`（`-shutdown` 除外）和立即关机写法（`Win32Shutdown` / `Stop-Computer` / `Restart-Computer` / 不带倒计时的 `shutdown`）；命中或钩子出错都拦截。被拦截时按提示改正，需要用户本人操作的就告诉用户，不换写法绕过。
 - 边界：命令文本匹配只防误操作，挡不住有意改写；电脑是内置 Administrator、UAC 关闭。用户接受这一取舍。
 
 ### 定时
