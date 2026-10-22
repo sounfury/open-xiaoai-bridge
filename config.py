@@ -381,15 +381,17 @@ APP_CONFIG = {
         "input_mode": "local_asr",
         # session_key 统一采用 agent:<agentId>:<rest> 格式，便于 after_wakeup 解析
         "session_key": "agent:default:open-xiaoai-bridge",
-        # 可选：把 session_key 作为请求头发给服务端，用于服务端长期记忆作用域。
-        # 默认设为 Hermes 的 "X-Hermes-Session-Key"；它只用于长期记忆作用域，
-        # chat/completions 仍是无状态（历史仍由 messages 携带），不会重复。
-        # 接标准 OpenAI/Ollama/LM Studio 时该头会被忽略（无害），如需彻底关闭可留空。
+        # 可选：把 session_key 作为请求头发给服务端，用于服务端长期记忆作用域（跨唤醒不变）。
+        # 默认设为 Hermes 的 "X-Hermes-Session-Key"；接标准 OpenAI/Ollama/LM Studio 时会被忽略，留空可关闭。
         "session_header": "X-Hermes-Session-Key",
+        # 一次唤醒一个服务端会话：进入连续对话时生成新 ID，每轮请求都带这个头，只发当前一句，
+        # Hermes 从 state.db 读回本次唤醒的历史（含工具调用结果）；退出对话后丢掉，下次唤醒换新的。
+        # bridge 本地不保存历史。Hermes 要求配置 api_key 才接受这个头；接没有会话功能的后端时，
+        # 每轮都只有当前一句（没有上下文）。
+        "session_id_header": "X-Hermes-Session-Id",
         "system_prompt": "",
         "temperature": 0.7,
         "max_tokens": 512,
-        "history_max_messages": 20,
         "response_timeout": 120,
         # 连续对话用流式回复：第一句出来就播（切段见 conversation.reply_segments）；False = 等整段回复再播
         "stream": True,

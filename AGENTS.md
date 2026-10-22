@@ -169,7 +169,9 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 - `VAD.resume()` 会自动 `_reset_state()` + `input_bytes.clear()`，清除旧的 `speech_frames` 和音频流缓冲（带 `preroll_from` 时再从 `GlobalStream` 历史补回）
 
 **流式回复和分段播报**（后端 `supports_streaming()` 为真时，目前只有 OpenAI / Hermes）:
-- `OpenAIManager.stream_reply(text)` 产出 `("text", delta)` / `("tool", hermes.tool.progress)`；只取 `delta.content`，不取 `reasoning_content`；结束或被取消时把已收到的回复记进历史
+- `OpenAIManager.stream_reply(text)` 产出 `("text", delta)` / `("tool", hermes.tool.progress)`；只取 `delta.content`，不取 `reasoning_content`
+- 会话由 Hermes 管理：`OpenAIConversationController` 进入连续对话时 `OpenAIManager.begin_conversation()` 生成新会话 ID，本次唤醒每轮请求带 `X-Hermes-Session-Id`、只发当前一句，Hermes 从 state.db 读回本次唤醒的历史（含工具调用结果和读过的 skill）；退出（再见 / 超时 / 被打断）时 `end_conversation()` 丢掉。bridge 本地不存历史；单次请求（API / 拦截小爱指令）每次一个新 ID。会话 ID 需要 `api_key`（Hermes 的 API_SERVER_KEY）
+  - 不要再把历史放进 `messages`：Hermes 对重复 `skill_view` 只回“内容未变”，客户端自己带纯文字历史时模型看不到 skill 正文，也看不到之前的工具调用
 - `ReplyStream` 在后台读流（创建即发请求，和"咻"并行）；`_speak_stream` 用 `core/services/tts/segmenter.py` 切段，送进 `core/services/tts/segment_player.py`
 - `tts_speaker == "xiaoai"`：`XiaoAINativeSegmentPlayer`（`mibrain text_to_speech save=1` 预生成 + `miplayer -f` 依次播放，临时文件 `/tmp/open-xiaoai-bridge-tts-*.mp3`）；其他 provider：`CallbackSegmentPlayer` 按段调 `_play_tts`
 - 工具开始、还没有正文时念一次 `openai.tool_filler`（"稍等" / "我查一下"）

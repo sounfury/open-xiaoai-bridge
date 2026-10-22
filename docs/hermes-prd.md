@@ -223,7 +223,8 @@ bridge 只负责音箱交互和协议对接；Hermes 的数据、工具和任务
 ### 运维约束
 
 - 配置有 profile 源配置（`~/hermes/profile`）和运行配置（`~/hermes/data`）两份，SOUL.md、config.yaml、MCP 源文件修改时两份同步。
-- Hermes 对进行中的会话复用首轮存下的系统提示词；音箱用固定 session key，修改 SOUL / 记忆 / skill 后要对该会话执行 `hermes sessions repair-prompts <session_id> --apply`。
+- bridge 一次唤醒一个服务端会话（2026-10-21 起）：进入连续对话时生成新 ID，每轮带 `X-Hermes-Session-Id`、只发当前一句，Hermes 从 state.db 读回本次唤醒的历史（含工具结果和 skill 正文）；退出后丢掉，下次唤醒换新的。此前 bridge 自带纯文字历史，Hermes 对重复 `skill_view` 只回“内容未变”，模型拿不到 skill 正文。
+- Hermes 对进行中的会话复用首轮存下的系统提示词；因为每次唤醒都是新会话，修改 SOUL / 记忆 / skill 后下次唤醒自动生效，不再需要 `hermes sessions repair-prompts`。
 - `~/hermes`、`~/home-tools` 不是 Git 仓库，修改前先备份；仓库 `deploy/` 下保留部署副本和说明。
 
 ## 5. 验收进度与风险

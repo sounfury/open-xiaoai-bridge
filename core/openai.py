@@ -2,10 +2,16 @@
 
 This module talks to any OpenAI-compatible Chat Completions endpoint,
 including Hermes Agent API server mode.
+
+会话由服务端管理：一次唤醒（连续对话从进入到退出）对应一个会话 ID，
+每轮请求只发当前这一句，并带 `X-Hermes-Session-Id`，Hermes 从自己的数据库读回
+这次唤醒里之前的对话和工具调用结果。bridge 本地不保存历史。
+下一次唤醒换新的会话 ID；跨唤醒的连续性靠 Hermes 长期记忆（`X-Hermes-Session-Key`）。
 """
 
 import asyncio
 import json
+import time
 import uuid
 from typing import Any, AsyncIterator
 
@@ -32,11 +38,14 @@ class OpenAIManager:
     # "X-Hermes-Session-Key" for long-term memory scoping). Standard OpenAI /
     # Ollama / LM Studio ignore the unknown header; set empty to disable.
     _session_header = "X-Hermes-Session-Key"
+    # 一次唤醒一个会话：Hermes 按这个 ID 从 state.db 读回本次唤醒的历史（需要 api_key）
+    _session_id_header = "X-Hermes-Session-Id"
+    _conversation_id: str | None = None
+    _session_id_warned = False
     _system_prompt = ""
     _temperature: float | None = None
     _max_tokens: int | None = None
     _timeout = 120
-    _history_max_messages = 20
     # 连续对话用流式回复（SSE）：第一句出来就播，还能收到 Hermes 的工具进度事件
     _stream = True
     _extra_body: dict[str, Any] = {}
@@ -46,7 +55,6 @@ class OpenAIManager:
     _tts_speed = 1.0
     _rule_prompt = ""
     _rule_prompt_for_skill = ""
-    _sessions: dict[str, list[dict[str, str]]] = {}
     _response_events: dict[str, asyncio.Future] = {}
     _response_texts: dict[str, str] = {}
     _response_tts_speakers: dict[str, str | None] = {}
@@ -97,9 +105,9 @@ class OpenAIManager:
         )
         cls._session_key = str(config.get("session_key", "agent:default:open-xiaoai-bridge"))
         cls._session_header = str(config.get("session_header", "X-Hermes-Session-Key") or "").strip()
+        cls._session_id_header = str(config.get("session_id_header", "X-Hermes-Session-Id") or "").strip()
         cls._system_prompt = str(config.get("system_prompt", "") or "")
         cls._timeout = int(config.get("response_timeout", 120))
-        cls._history_max_messages = max(0, int(config.get("history_max_messages", 20)))
         cls._stream = bool(config.get("stream", True))
         cls._temperature = cls._optional_float(config.get("temperature"))
         cls._max_tokens = cls._optional_int(config.get("max_tokens"))
@@ -171,7 +179,7 @@ class OpenAIManager:
         - ("tool", dict)：Hermes 的 `event: hermes.tool.progress`，
           {"tool", "emoji", "label", "toolCallId", "status": "running" | "completed"}
 
-        结束后（包括调用方中途停止 / 被取消）把已经收到的回复记进历史。
+        历史由 Hermes 按会话 ID 保存（包括中途停止时已生成的部分），这里不记。
         请求失败时抛异常（last_error 同步设置）。
         """
         if not cls._initialized:
@@ -179,10 +187,9 @@ class OpenAIManager:
         if not cls._enabled:
             raise RuntimeError("OpenAI backend is disabled")
 
-        session_key = cls._session_key
-        history = cls._sessions.setdefault(session_key, [])
-        payload = cls._build_payload(history, text, stream=True)
-        module = f"OpenAI({session_key})"
+        payload = cls._build_payload(text, stream=True)
+        headers = cls._headers()
+        module = f"OpenAI({cls._session_key})"
         logger.user_speech(text, module=module)
         cls.last_error = None
         parts: list[str] = []
@@ -192,7 +199,7 @@ class OpenAIManager:
                 timeout=aiohttp.ClientTimeout(total=cls._timeout)
             ) as session:
                 async with session.post(
-                    cls._chat_completions_url(), json=payload, headers=cls._headers()
+                    cls._chat_completions_url(), json=payload, headers=headers
                 ) as response:
                     content_type = response.headers.get("Content-Type", "unknown")
                     if response.status >= 400:
@@ -259,7 +266,6 @@ class OpenAIManager:
         finally:
             reply = "".join(parts).strip()
             if reply:
-                cls._append_history(history, text, reply)
                 if completed:
                     logger.ai_response(reply, module=module)
                 else:
@@ -273,8 +279,18 @@ class OpenAIManager:
         cls._session_key = session_key
 
     @classmethod
-    def reset_session(cls, session_key: str | None = None):
-        cls._sessions.pop(session_key or cls._session_key, None)
+    def begin_conversation(cls) -> str:
+        """唤醒进入连续对话时调用：开一个新的服务端会话，本次唤醒的每一轮都用它。"""
+        cls._conversation_id = cls._new_session_id()
+        logger.info(f"[OpenAI] 新会话: {cls._conversation_id}")
+        return cls._conversation_id
+
+    @classmethod
+    def end_conversation(cls):
+        """退出连续对话（说再见、超时、被打断）时调用：丢掉会话 ID，下次唤醒换新的。"""
+        if cls._conversation_id:
+            logger.info(f"[OpenAI] 会话结束: {cls._conversation_id}")
+        cls._conversation_id = None
 
     @classmethod
     def get_tts_speaker_for_session_key(cls, session_key: str | None = None) -> str | None:
@@ -385,9 +401,7 @@ class OpenAIManager:
 
     @classmethod
     async def _request_chat_completion(cls, text: str) -> str | None:
-        session_key = cls._session_key
-        history = cls._sessions.setdefault(session_key, [])
-        payload = cls._build_payload(history, text, stream=False)
+        payload = cls._build_payload(text, stream=False)
         headers = cls._headers()
 
         async with aiohttp.ClientSession(
@@ -412,16 +426,13 @@ class OpenAIManager:
                         f"(Content-Type={response.headers.get('Content-Type', 'unknown')})"
                     ) from exc
 
-        response_text = cls._extract_response_text(body)
-        if response_text:
-            cls._append_history(history, text, response_text)
-        return response_text
+        return cls._extract_response_text(body)
 
     @classmethod
-    def _build_payload(cls, history: list[dict[str, str]], text: str, stream: bool) -> dict[str, Any]:
+    def _build_payload(cls, text: str, stream: bool) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "model": cls._model,
-            "messages": cls._build_messages(history, text),
+            "messages": cls._build_messages(text),
             "stream": stream,
             **cls._extra_body,
         }
@@ -458,13 +469,25 @@ class OpenAIManager:
         headers = {"Content-Type": "application/json"}
         if cls._api_key:
             headers["Authorization"] = f"Bearer {cls._api_key}"
-        # Scope server-side long-term memory to this session (e.g. Hermes'
-        # X-Hermes-Session-Key). chat/completions stays stateless — the
-        # messages array is still the source of turn history — so this does
-        # not duplicate context.
+        # 长期记忆作用域（Hermes 的 X-Hermes-Session-Key），跨唤醒不变
         if cls._session_header and cls._session_key:
             headers[cls._session_header] = cls._session_key
+        # 会话 ID：连续对话里用本次唤醒的 ID；单次请求（API / 拦截小爱指令）每次新开一个，
+        # 避免相同的话被服务端按内容指纹并进同一个旧会话
+        if cls._session_id_header:
+            if cls._api_key:
+                headers[cls._session_id_header] = cls._conversation_id or cls._new_session_id()
+            elif not cls._session_id_warned:
+                cls._session_id_warned = True
+                logger.warning(
+                    "[OpenAI] 没有配置 api_key，Hermes 不接受 X-Hermes-Session-Id："
+                    "每轮只发当前一句，后端看不到本次唤醒前面的对话"
+                )
         return headers
+
+    @classmethod
+    def _new_session_id(cls) -> str:
+        return f"xiaoai-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
 
     @classmethod
     def _chat_completions_url(cls) -> str:
@@ -473,26 +496,13 @@ class OpenAIManager:
         return cls._base_url.rstrip("/") + "/chat/completions"
 
     @classmethod
-    def _build_messages(cls, history: list[dict[str, str]], text: str) -> list[dict[str, str]]:
+    def _build_messages(cls, text: str) -> list[dict[str, str]]:
+        """只发当前这一句；之前的对话由服务端按会话 ID 读回。"""
         messages: list[dict[str, str]] = []
         if cls._system_prompt:
             messages.append({"role": "system", "content": cls._system_prompt})
-        messages.extend(history[-cls._history_max_messages :] if cls._history_max_messages else [])
         messages.append({"role": "user", "content": text})
         return messages
-
-    @classmethod
-    def _append_history(cls, history: list[dict[str, str]], text: str, response_text: str):
-        if cls._history_max_messages <= 0:
-            return
-        history.extend(
-            [
-                {"role": "user", "content": text},
-                {"role": "assistant", "content": response_text},
-            ]
-        )
-        if len(history) > cls._history_max_messages:
-            del history[: len(history) - cls._history_max_messages]
 
     @classmethod
     def _extract_response_text(cls, body: Any) -> str | None:

@@ -509,7 +509,7 @@ Bridge 的 TTS provider 配置跟随各个后端，配置层级保持不变：
     "system_prompt": "",
     "temperature": 0.7,
     "max_tokens": 512,
-    "history_max_messages": 20,
+    "session_id_header": "X-Hermes-Session-Id",  # 一次唤醒一个服务端会话
     "tts_provider": "mlx_audio",  # 详见「🔊 TTS 配置」
     "tts_speaker": "xiaoai",
 }
@@ -539,7 +539,7 @@ if "让小黑" in text:
     return None
 ```
 
-`base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。连续对话会按 `session_key` 保存最近 `history_max_messages` 条上下文；需要隔离多个助手时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。
+`base_url` 可以直接填到 `/v1`，框架会自动调用 `/chat/completions`；如果你的服务已经给出完整 `/v1/chat/completions` 地址，也可以直接填写完整地址。会话由服务端管理：每次唤醒进入连续对话时生成一个新的会话 ID，这次唤醒的每一轮都带 `X-Hermes-Session-Id`，只发当前这一句，Hermes 从自己的数据库读回本次唤醒的对话和工具调用结果；退出对话（再见、超时、被打断）后丢掉，下次唤醒换新的。bridge 本地不保存历史，跨唤醒的连续性靠 Hermes 长期记忆（`session_key` 通过 `X-Hermes-Session-Key` 发送）。Hermes 要求配置 `api_key` 才接受会话 ID；接没有会话功能的后端时，每轮只有当前一句。需要隔离多个助手的长期记忆时，可在唤醒前调用 `app.set_openai_session_key("assistant-name")`。
 
 ### 流式回复和分段播报
 
