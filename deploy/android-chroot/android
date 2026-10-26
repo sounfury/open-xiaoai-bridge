@@ -1,0 +1,24 @@
+#!/bin/bash
+# 在 chroot 里执行 Android 侧命令（root，Android 的 /system，环境变量取自 zygote）
+#   android 'input tap 500 800'
+#   android 'uiautomator dump /data/local/tmp/ui.xml'; android 'cat /data/local/tmp/ui.xml' > ui.xml
+#   android                            （不带参数：进入 Android 的 sh）
+# 注意：Android 侧的 /data 和 chroot 里的不是同一棵树，chroot 根目录是 Android 的 /data/local/ubuntu；
+# 文件用 android 'cat ...' 读出来最省事。
+read -r -d '' INIT <<'SH'
+z=$(pidof -s zygote64 || pidof -s zygote)
+env_file=/data/local/tmp/.android-env.$$
+tr '\0' '\n' < /proc/$z/environ > $env_file
+while IFS= read -r kv; do
+  case "$kv" in [A-Z_]*=*) export "$kv" ;; esac
+done < $env_file
+rm -f $env_file
+export PATH=/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin
+cd /
+SH
+if [ $# -eq 0 ]; then
+  exec nsenter -t 1 -m -r -w -- /system/bin/sh -c "$INIT
+exec /system/bin/sh"
+fi
+exec nsenter -t 1 -m -r -w -- /system/bin/sh -c "$INIT
+$*"

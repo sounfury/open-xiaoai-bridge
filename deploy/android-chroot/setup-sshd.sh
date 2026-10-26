@@ -24,6 +24,8 @@ export LANG=${LANG:-C.UTF-8}
 export TZ=Asia/Shanghai
 case ":$PATH:" in *:/root/.local/bin:*) ;; *) PATH=/root/.local/bin:/root/.cargo/bin:$PATH ;; esac
 export PATH
+# 不让 uv 把镜像地址写进 uv.lock（改依赖时临时 UV_FROZEN=0）
+export UV_FROZEN=1
 EOF
 # ssh 主机 '命令' 不读 profile，只读 .bashrc（且在非交互判断之前）
 grep -q 10-tablet.sh /root/.bashrc 2>/dev/null || sed -i '1i . /etc/profile.d/10-tablet.sh; [ -f /root/.cargo/env ] && . /root/.cargo/env' /root/.bashrc
@@ -36,6 +38,7 @@ for f in "$@"; do
 done
 chown -R root:root /root/.ssh && chmod 600 /root/.ssh/authorized_keys
 
+install -m 755 "$(dirname "$0")/android" /usr/local/bin/android 2>/dev/null || true  # chroot 里执行 Android 侧命令
 ssh-keygen -A >/dev/null
 mkdir -p /run/sshd && chmod 755 /run/sshd
 /usr/sbin/sshd -t
