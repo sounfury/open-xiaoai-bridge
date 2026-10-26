@@ -26,6 +26,7 @@ import time
 import numpy as np
 
 from core.utils.logger import logger
+from core.services.diagnostics import diagnostics
 
 LOG_MODULE = "MultiMic"
 CHANNELS = 4  # ch0~ch2 麦克风，ch3 回采
@@ -98,11 +99,11 @@ class MultiMicInput:
 
     # ---- KWS 线程接口 ----
 
-    def pull(self) -> list[tuple[str, bytes]]:
-        """取出各路已经攒满的 512 采样帧，按 (路名, 帧) 交错返回（同一时刻的各路相邻）。"""
+    def pull(self, max_frames: int = 1) -> list[tuple[str, bytes]]:
+        """每路最多取 max_frames 帧，避免多麦批处理长期挤占主麦检测。"""
         out: list[tuple[str, bytes]] = []
         with self._lock:
-            n = min(len(buf) for buf in self._buffers.values()) // (FRAME * 2)
+            n = min(max_frames, min(len(buf) for buf in self._buffers.values()) // (FRAME * 2))
             for i in range(n):
                 for name, buf in self._buffers.items():
                     out.append((name, bytes(buf[i * FRAME * 2 : (i + 1) * FRAME * 2])))
@@ -115,6 +116,23 @@ class MultiMicInput:
         with self._lock:
             for buf in self._buffers.values():
                 buf.clear()
+
+    def diagnostic_state(self, now: float) -> dict:
+        """不等音频锁，防止诊断线程也被故障线程拖住。"""
+        state = {
+            "connected": self._conn is not None, "connects": self.connects,
+            "input_age_ms": round((now - self._last_data) * 1000, 1) if self._last_data else None,
+            "audio_s_total": round(self.bytes_in / (2 * CHANNELS * SR), 1),
+            "dsp_s_total": round(self.dsp_s, 2),
+        }
+        if self._lock.acquire(blocking=False):
+            try:
+                state["queued_ms"] = {name: round(len(buf) / 32, 1) for name, buf in self._buffers.items()}
+            finally:
+                self._lock.release()
+        else:
+            state["buffer_lock_busy"] = True
+        return state
 
     @property
     def live(self) -> bool:
@@ -160,6 +178,7 @@ class MultiMicInput:
                 except OSError:
                     pass
             self.connects += 1
+            diagnostics.event("multimic.connected", connects=self.connects, replaced=old is not None)
             logger.info(f"音箱多麦录音已连接：{addr[0]}（第 {self.connects} 次）", module=LOG_MODULE)
             threading.Thread(target=self._receive, args=(conn,), daemon=True, name="multimic-conn").start()
 
@@ -173,6 +192,7 @@ class MultiMicInput:
             while self._conn is conn:
                 chunk = conn.recv(BLOCK * frame_bytes)
                 if not chunk:
+                    diagnostics.event("multimic.eof")
                     break
                 self._last_data = time.monotonic()
                 self.bytes_in += len(chunk)
@@ -184,8 +204,12 @@ class MultiMicInput:
                     with self._dsp_lock:
                         if self._conn is not conn:
                             break
-                        self._process(data.astype(np.float64))
+                        # TCP 碎包先攒满 BLOCK；预算按本次实际会处理的采样数计算。
+                        processable = (len(self._pending) + len(data)) // BLOCK * BLOCK
+                        with diagnostics.measure("multimic.dsp", audio_s=processable / SR, warn_s=0.2):
+                            self._process(data.astype(np.float64))
         except (OSError, socket.timeout) as exc:
+            diagnostics.event("multimic.receive_error", error_type=type(exc).__name__, current=self._conn is conn)
             logger.debug(f"多麦输入连接结束: {exc}", module=LOG_MODULE)
         finally:
             try:
@@ -225,6 +249,7 @@ class MultiMicInput:
                 buf = self._buffers[name]
                 buf.extend(pcm)
                 if len(buf) > self._max_buffer:
+                    diagnostics.count("multimic.dropped_samples", (len(buf) - self._max_buffer) // 2)
                     del buf[: len(buf) - self._max_buffer]
         self.dsp_s += time.perf_counter() - started
 
@@ -266,12 +291,19 @@ class MultiMicInput:
             if app is None or speaker is None or getattr(app, "loop", None) is None:
                 continue
             last_try = now
+            diagnostics.event("multimic.restart_requested", input_age_ms=round((now - self._last_data) * 1000) if self._last_data else None)
             try:
                 future = asyncio.run_coroutine_threadsafe(
                     speaker.run_shell(self._device_command(), timeout=5000), app.loop
                 )
-                result = future.result(timeout=8)
+                # 等待超时不表示任务取消；记录最终完成时刻，识别延迟执行的重启。
+                def completed(done, requested=now):
+                    diagnostics.event("multimic.restart_finished", elapsed_ms=round((time.monotonic() - requested) * 1000), cancelled=done.cancelled())
+                future.add_done_callback(completed)
+                with diagnostics.measure("multimic.restart_wait", warn_s=2):
+                    result = future.result(timeout=8)
             except Exception as exc:
+                diagnostics.event("multimic.restart_wait_error", error_type=type(exc).__name__)
                 logger.debug(f"启动音箱多麦录音失败: {type(exc).__name__}: {exc}", module=LOG_MODULE)
                 continue
             if result is None or getattr(result, "exit_code", 1) != 0:

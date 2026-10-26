@@ -191,7 +191,8 @@ OpenClaw 连续对话控制器。唤醒词触发后进入独立的 VAD → ASR �
 - 后台任务按最新状态切灯，不阻塞语音流程；`set()` 可在 VAD/KWS 线程调用
 
 **VAD 状态泄漏陷阱**:
-- VAD 检测循环持续运行，`speech_frames` 会不断积累音频帧
+- `VAD.start()` 只初始化线程并保持暂停，输入流以 `start=False` 创建；会话调用 `resume("speech"/"silence")` 后才订阅音频。空闲唤醒由独立 KWS 负责。
+- 2026-10-26 真机复现：首次唤醒前 `target=None` 仍处理人声，累计 768.8 秒历史（list 容器约 196 MB）；每帧 `bytes(speech_frames)` 平均耗时约 143 ms，拖慢 KWS/收包并导致停播 RPC 超时。仅在 `target="speech"` 保存开口预录，且仅派发 `on_speech` 时转换 bytes；等停顿时的完整录音由会话层 / codec 保存。
 - 如果 `resume()` 不调用 `_reset_state()`，旧帧（唤醒词回声、TTS 回声）会泄漏到下一轮检测，导致 ASR 识别出幽灵音频
 - `pause()` 会调 `_reset_state()`，但 `resume()` 必须也调——两者都需要清理状态
 

@@ -155,13 +155,12 @@ APP_CONFIG = {
         "keyword_tail_ms": 100,
         # 没有回采、重新开麦后丢掉开头这么长（可能带着提示音余音），ms
         "mic_start_skip_ms": 150,
-        # 断句：停顿这么久算说完（只用于连续对话，vad.min_silence_duration 给小智流程用），ms。
-        # OwnDing 在同款音箱上用 500（他的延迟报告建议还能降到 300～350）；这里另有下面的
-        # "像没说完再等"兜底。800 时"说完到发出"约 1.0 秒，其中 0.8 秒是这段等待
-        "end_silence_ms": 500,
-        # 停顿时先识别一遍，像没说完（"今天会很"、"帮我把"、"那个"）就接着听，静音总共等到这么久，ms；
-        # 规则见 core/utterance.py。设成和 end_silence_ms 一样就关闭
-        "hesitation_silence_ms": 1800,
+        # 断句：连续静音至少这么久才检查句尾（只用于连续对话），ms。
+        # 允许句中换气和短暂停顿；识别检查期间仍持续收音，续话会撤销旧断句。
+        "end_silence_ms": 1200,
+        # 句尾像没说完（"帮我把"、"凌晨12点的"、"那个"）时，连续静音总共等到这么久，ms。
+        # 规则见 core/utterance.py。设成和 end_silence_ms 一样就关闭额外等待。
+        "hesitation_silence_ms": 2600,
         # 流式回复怎么切段（openai.stream=True 时）：第一段尽快播，后面攒长一点少停顿
         "reply_segments": {
             "first_min_chars": 8,  # 第一段在句号处就出；在逗号处切需要至少这么多字

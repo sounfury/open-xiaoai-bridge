@@ -275,6 +275,11 @@ class ExternalConversationController:
             )
         finally:
             self.stop()
+            pending = list(self._background_tasks)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
             light, self._light = self._light, None
             if light is not None:
                 await light.close()
@@ -707,48 +712,77 @@ class ExternalConversationController:
         is_recording = False
         loop = self._loop
 
-        # 断句：停顿 end_silence_ms 算说完；识别出来像没说完（"今天会很"、"那个"）时，
-        # 静音总共等到 hesitation_silence_ms，期间接着说就继续录
-        end_ms = self._conv_int("end_silence_ms", 800)
-        extra_ms = max(0, self._conv_int("hesitation_silence_ms", 1800) - end_ms)
-        max_extensions = 3
-        endpoint = {"pos": None, "extended": False, "count": 0}
+        # 断句：普通停顿至少等 1.2 秒；像没说完时等到 2.6 秒。
+        # 检查期间 VAD 继续跑；每读到一帧人声就使旧识别结果失效。
+        end_ms = max(32, self._conv_int("end_silence_ms", 1200))
+        extra_ms = max(0, self._conv_int("hesitation_silence_ms", 2600) - end_ms)
+        endpoint = {
+            "pos": None, "extended": False, "version": 0,
+            "checking": False, "silence_after_check": False, "asr": None,
+        }
         self._last_asr = None
         vad.silence_override_ms = end_ms
+        capture_future = self._vad_future
+        check_task: asyncio.Task | None = None
 
         original_on_speech = EventManager.on_speech
         original_on_silence = EventManager.on_silence
 
-        def _finish():
-            if self._vad_future and not self._vad_future.done():
-                self._vad_future.set_result(b"".join(recording_frames))
+        def _listening():
+            return self.active and self._vad_future is capture_future and not capture_future.done()
 
-        async def _check_unfinished():
-            """停顿到了：先识别一遍，像没说完就接着听，否则结束。"""
+        def _finish(version=None):
+            if not _listening() or (version is not None and version != endpoint["version"]):
+                return
+            vad.pause()
             audio = b"".join(recording_frames)
-            text = ""
-            try:
-                from core.services.audio.asr import ASRService
+            cached = endpoint["asr"]
+            if cached and cached[0] == endpoint["version"]:
+                # 检查后只有静音增加时，复用识别；有新的人声则一定重新识别。
+                self._last_asr = (len(audio), cached[1])
+            capture_future.set_result(audio)
 
-                text = await loop.run_in_executor(None, lambda: ASRService.asr(audio, sample_rate=16000)) or ""
-            except Exception as exc:
-                logger.debug(f"Endpoint ASR failed: {exc}", module=self.LOG_MODULE)
-            if not self.active or not self._vad_future or self._vad_future.done():
+        async def _check_unfinished(audio, version):
+            """识别候选句尾，同时继续收音；续话会撤销旧候选。"""
+            while _listening():
+                text = ""
+                try:
+                    from core.services.audio.asr import ASRService
+
+                    text = await loop.run_in_executor(None, lambda: ASRService.asr(audio, sample_rate=16000)) or ""
+                except Exception as exc:
+                    logger.debug(f"Endpoint ASR failed: {exc}", module=self.LOG_MODULE)
+                if not _listening():
+                    return
+                if version != endpoint["version"]:
+                    logger.debug("断句检查期间检测到续话，撤销旧断句", module=self.LOG_MODULE)
+                    if endpoint["silence_after_check"]:
+                        # 续话也已经停顿了，串行检查最新片段，不并发跑多个 ASR。
+                        audio = b"".join(recording_frames)
+                        version = endpoint["version"]
+                        endpoint["silence_after_check"] = False
+                        continue
+                    endpoint["checking"] = False
+                    return
+                endpoint["checking"] = False
+                endpoint["asr"] = (version, text)
+                unfinished = bool(text and (looks_unfinished(text) or is_filler_only(text)))
+                TurnTimer.mark(
+                    "断句识别",
+                    f"{len(audio) / 32000:.1f}s 音频" + ("，像没说完" if unfinished else ""),
+                )
+                if unfinished and not endpoint["silence_after_check"]:
+                    endpoint["extended"] = True
+                    logger.info(f"⏳ 像没说完，再等一下：{text}", module=self.LOG_MODULE)
+                    # 已在持续听额外静音，识别耗时也包含在等待内，不重置录音。
+                    return
+                _finish(version)
                 return
-            unfinished = bool(text and (looks_unfinished(text) or is_filler_only(text)))
-            TurnTimer.mark(
-                "断句识别",
-                f"{len(audio) / 32000:.1f}s 音频" + ("，像没说完" if unfinished else ""),
-            )
-            if unfinished and endpoint["pos"] is not None:
-                endpoint["extended"] = True
-                endpoint["count"] += 1
-                vad.silence_override_ms = extra_ms
-                logger.info(f"⏳ 像没说完，再等一下：{text}", module=self.LOG_MODULE)
-                vad.resume("silence", replay_from=endpoint["pos"])
-                return
-            self._last_asr = (len(audio), text)
-            _finish()
+
+        def _schedule_check(audio, version):
+            nonlocal check_task
+            if _listening():
+                check_task = loop.create_task(_check_unfinished(audio, version))
 
         def _on_speech_hook(speech_buffer: bytes):
             """Voice detected — save initial buffer, start recording, wait for silence."""
@@ -758,17 +792,30 @@ class ExternalConversationController:
             TurnTimer.mark("开口", f"VAD 落后 {lag_ms(vad.stream.unread_samples())}ms")
             self._light_state("hearing")
             logger.debug(f"VAD speech detected, buffer size: {len(speech_buffer)}", module=self.LOG_MODULE)
-            # Now wait for silence to know user stopped speaking
             vad.resume("silence")
 
         def _on_silence_hook():
-            """Silence detected — check whether the sentence looks finished, then resolve."""
+            """停顿时立即接着收音，后台检查候选句尾。"""
+            if not _listening():
+                return
             logger.debug("VAD detected silence", module=self.LOG_MODULE)
             TurnTimer.mark("停顿", f"VAD 落后 {lag_ms(vad.stream.unread_samples())}ms")
-            if extra_ms and not endpoint["extended"] and endpoint["count"] < max_extensions:
-                loop.call_soon_threadsafe(lambda: self._background(_check_unfinished()))
+            if not extra_ms or endpoint["extended"]:
+                loop.call_soon_threadsafe(_finish)
                 return
-            loop.call_soon_threadsafe(_finish)
+            checking = endpoint["checking"]
+            if checking:
+                endpoint["silence_after_check"] = True
+            else:
+                endpoint["checking"] = True
+                endpoint["silence_after_check"] = False
+                audio = b"".join(recording_frames)
+                version = endpoint["version"]
+            # pause() 会停掉 VAD 输入，必须从刚读到的位置补回检查期间的声音。
+            vad.silence_override_ms = max(32, extra_ms)
+            vad.resume("silence", replay_from=endpoint["pos"])
+            if not checking:
+                loop.call_soon_threadsafe(_schedule_check, audio, version)
 
         # Tap into VAD's audio stream to record frames while waiting for silence
         _orig_handle_speech = vad._handle_speech_frame
@@ -779,10 +826,11 @@ class ExternalConversationController:
                 recording_frames.append(bytes(frames))
                 endpoint["pos"] = vad.stream.position()
                 TurnTimer.speech_end_pos = endpoint["pos"]  # 最后一帧人声：算"说完到发出"
-                if endpoint["extended"]:
-                    # 接着说了：恢复正常断句，下次停顿再判断
-                    endpoint["extended"] = False
-                    vad.silence_override_ms = end_ms
+                endpoint["version"] += 1
+                endpoint["asr"] = None
+                endpoint["silence_after_check"] = False
+                endpoint["extended"] = False
+                vad.silence_override_ms = end_ms
             _orig_handle_speech(frames)
 
         def _recording_silence_frame(frames):
@@ -822,6 +870,11 @@ class ExternalConversationController:
             return None
 
         finally:
+            # 检查期间也持续收音；退出本次捕获后再恢复共享 VAD 的回调。
+            vad.pause()
+            if check_task and not check_task.done():
+                check_task.cancel()
+                await asyncio.gather(check_task, return_exceptions=True)
             EventManager.on_speech = original_on_speech
             EventManager.on_silence = original_on_silence
             vad._handle_speech_frame = _orig_handle_speech
@@ -1001,11 +1054,15 @@ class ExternalConversationController:
             await asyncio.wait({tts, hit}, return_when=asyncio.FIRST_COMPLETED)
         except asyncio.CancelledError:
             tts.cancel()
+            hit.cancel()
+            # 等播放器 abort / HTTP 断流完成，才能把播放权交给下一个会话。
+            await asyncio.gather(tts, return_exceptions=True)
             raise
         finally:
             kws.disarm_barge_in()
         if not hit.done() or hit.cancelled():
             hit.cancel()
+            await tts
             return False
 
         keyword, position = hit.result()
@@ -1166,8 +1223,8 @@ class ExternalConversationController:
                 segments.append(t)
                 await player.add(t)
 
-        await player.start()
         try:
+            await player.start()
             while True:
                 try:
                     kind, value = await asyncio.wait_for(reply.queue.get(), timeout=flush_s)

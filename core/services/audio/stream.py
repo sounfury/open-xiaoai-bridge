@@ -122,6 +122,19 @@ class MyStream:
         self.input_bytes.clear()
         self._read_offset = 0
 
+    def trim_input(self, max_samples: int, keep_samples: int) -> int:
+        """积压超过上限时只保留最近的音频，返回丢弃的采样数。
+
+        与原生输入回调互斥，游标和缓冲一起更新，供实时检测跳过过时音频。
+        """
+        with GlobalStream._lock:
+            unread = self.unread_samples()
+            if unread <= max_samples:
+                return 0
+            keep = max(0, min(keep_samples, unread))
+            self._read_offset = len(self.input_bytes) - keep * _BYTES_PER_SAMPLE
+            return unread - keep
+
     def start_stream(self, since: int | None = None) -> None:
         """开始接收输入；since（绝对采样位置）表示先回放从那里到现在的历史。"""
         if not self._is_active:

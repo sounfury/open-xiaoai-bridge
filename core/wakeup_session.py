@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from core.ref import (
     get_app,
@@ -23,6 +24,9 @@ class WakeupSessionManager:
         self._qwenpaw_controller = None
         self._qwenpaw_task: asyncio.Task | None = None
         self._xiaozhi_future: asyncio.Future | None = None
+        # 只在 MainApp.loop 读写；整个唤醒过程（含重置与会话）只有一个拥有者。
+        self._wakeup_task: asyncio.Task | None = None
+        self._interrupt_task: asyncio.Task | None = None
 
     def _get_loop(self):
         app = get_app()
@@ -32,55 +36,86 @@ class WakeupSessionManager:
         return XiaoAI.async_loop
 
     async def _stop_device_playback(self):
-        """Stop all audio playback on the device and restart recording.
-
-        - killall tts_play.sh miplayer: stop blocking TTS (tts_play.sh + child miplayer)
-        - mphelper pause: stop non-blocking TTS (mibrain text_to_speech via mediaplayer)
-        - stop_playing: kill aplay (our PCM channel)
-        - start_playing / start_recording: restart audio streams
-        """
-        speaker = get_speaker()
-        if speaker:
-            await speaker.stop_device_audio()
-            import open_xiaoai_server
-            await open_xiaoai_server.start_recording()
-            return
-
+        """先停播放；回采仍在线时保留录音，避免每次唤醒都重启采集。"""
         import open_xiaoai_server
-        await open_xiaoai_server.stop_playing()
-        await open_xiaoai_server.start_recording()
+        from core.xiaoai import XiaoAI
+
+        step = "停止播放"
+        started = time.monotonic()
+        try:
+            async with asyncio.timeout(5):
+                speaker = get_speaker()
+                if speaker:
+                    await speaker.stop_device_audio()
+                else:
+                    await open_xiaoai_server.stop_playing()
+                if not XiaoAI.echo_reference_live():
+                    step = "恢复录音"
+                    await open_xiaoai_server.start_recording()
+                XiaoAI.set_recording_wanted(True)
+        except TimeoutError:
+            logger.error(f"[Wakeup] {step}超时，取消本次唤醒，避免延迟后突然播报")
+            raise
+        finally:
+            elapsed = time.monotonic() - started
+            if elapsed > 1:
+                logger.warning(f"[Wakeup] 设备音频重置耗时 {elapsed:.1f}s（最后步骤: {step}）")
 
     def on_interrupt(self):
+        # 原生事件来自桥接线程，业务状态和取消操作统一回到主循环。
+        self._get_loop().call_soon_threadsafe(self._schedule_interrupt)
+
+    def _schedule_interrupt(self):
+        if self._interrupt_task and not self._interrupt_task.done():
+            return
         logger.info("[Wakeup] XiaoAI wakeup — interrupting active sessions")
+        self._interrupt_task = asyncio.create_task(self._interrupt_sessions(self._wakeup_task))
+        self._interrupt_task.add_done_callback(self._log_interrupt_result)
 
-        loop = self._get_loop()
+    @staticmethod
+    def _log_interrupt_result(task):
+        if not task.cancelled() and task.exception():
+            logger.error(f"[Wakeup] Interrupt failed: {task.exception()}")
 
-        # Stop XiaoZhi wakeup session (cancels futures + aborts server audio)
-        if self._xiaozhi_future and not self._xiaozhi_future.done():
-            self._xiaozhi_future.cancel()
-        self._xiaozhi_future = None
-        xiaozhi = get_xiaozhi()
-        if xiaozhi:
-            xiaozhi.stop_wakeup_session()
+    async def _interrupt_sessions(self, owner):
+        kws = get_kws()
+        if kws:
+            kws.pause()
+        try:
+            if owner and not owner.done() and not owner.cancelling():
+                owner.cancel()
+            await self._stop_external_sessions()
+            if owner:
+                await asyncio.gather(owner, return_exceptions=True)
+            if self._xiaozhi_future and not self._xiaozhi_future.done():
+                self._xiaozhi_future.cancel()
+            self._xiaozhi_future = None
+            xiaozhi = get_xiaozhi()
+            if xiaozhi:
+                xiaozhi.stop_wakeup_session()
+            from core.xiaoai import XiaoAI
 
-        # Stop external backend conversations (cancels VAD + stops TTS stream + kills aplay)
-        if self._openclaw_controller and self._openclaw_controller.is_active():
-            self._openclaw_controller.stop()
-        if self._openclaw_task and not self._openclaw_task.done():
-            loop.call_soon_threadsafe(self._openclaw_task.cancel)
-        if self._openai_controller and self._openai_controller.is_active():
-            self._openai_controller.stop()
-        if self._openai_task and not self._openai_task.done():
-            loop.call_soon_threadsafe(self._openai_task.cancel)
-        if self._qwenpaw_controller and self._qwenpaw_controller.is_active():
-            self._qwenpaw_controller.stop()
-        if self._qwenpaw_task and not self._qwenpaw_task.done():
-            loop.call_soon_threadsafe(self._qwenpaw_task.cancel)
+            XiaoAI.stop_conversation()
+            await self._stop_device_playback()
+        finally:
+            if kws:
+                kws.resume()
 
-        asyncio.run_coroutine_threadsafe(self._stop_device_playback(), loop)
-
-        from core.xiaoai import XiaoAI
-        XiaoAI.stop_conversation()
+    async def _stop_external_sessions(self):
+        """取消并等到旧会话彻底退出，包括子播放器的清理。"""
+        tasks = []
+        for name in ("openclaw", "openai", "qwenpaw"):
+            controller = getattr(self, f"_{name}_controller")
+            task = getattr(self, f"_{name}_task")
+            if controller and controller.is_active():
+                controller.stop()
+            if task and not task.done():
+                # owner.cancel() 会沿 await 传播取消，不能再次取消正在清理播放器的任务。
+                if not task.cancelling():
+                    task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def on_wakeup(self):
         logger.info("[Wakeup] Wakeup session started")
@@ -128,15 +163,43 @@ class WakeupSessionManager:
                 )
         return False
 
-    async def wakeup(self, text, source, position: int | None = None):
-        """position：KWS 命中时唤醒词结束的 GlobalStream 绝对采样位置，
-        外部后端对话从这里接着听（"你好缪斯，开灯"里的"开灯"不丢）。"""
+    async def wakeup(self, text, source, position: int | None = None, detected_at: float | None = None):
+        """统一在业务主循环处理唤醒；重复请求直接丢弃，不排队重放。"""
+        loop = self._get_loop()
+        if asyncio.get_running_loop() is not loop:
+            return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(
+                self.wakeup(text, source, position, detected_at), loop
+            ))
+        owner = asyncio.current_task()
+        if self._wakeup_task and not self._wakeup_task.done():
+            logger.debug(f"[Wakeup] 忽略会话期间的重复唤醒: {text}")
+            return
+        self._wakeup_task = owner
+        kws = get_kws()
+        if kws:
+            kws.pause()
+        try:
+            if self._interrupt_task and not self._interrupt_task.done():
+                await asyncio.shield(self._interrupt_task)
+                if kws:
+                    kws.pause()
+            if detected_at is not None and time.monotonic() - detected_at > 2:
+                logger.warning(f"[Wakeup] 丢弃过时唤醒: {text}（等待 {time.monotonic() - detected_at:.1f}s）")
+                return
+            await self._run_wakeup(text, source, position)
+        finally:
+            if self._wakeup_task is owner:
+                self._wakeup_task = None
+                if kws:
+                    kws.resume()
+
+    async def _run_wakeup(self, text, source, position: int | None):
+        """position 是唤醒词结束的采样位置，供第一轮补录紧接着说出的内容。"""
         before_wakeup = self.config.get_app_config("wakeup.before_wakeup")
         if source != "kws":
             from core.utils.turn_timer import TurnTimer
 
             TurnTimer.begin(f"{source} 唤醒")  # KWS 命中时已在 KWS 线程开始计时
-        kws = get_kws()
         logger.debug(f"[Wakeup] Received wakeup request from {source}: {text}")
 
         # Reset session_key to config default before each wakeup,
@@ -157,16 +220,12 @@ class WakeupSessionManager:
         ).get("session_key", "agent:default:open-xiaoai-bridge")
         QwenPawManager._session_key = default_qwenpaw_session_key
 
-        if kws:
-            kws.pause()
         should_wakeup = await before_wakeup(
             get_speaker(),
             text,
             source,
             get_app(),
         )
-        if kws:
-            kws.resume()
         logger.info(f"[Wakeup] before_wakeup returned: {should_wakeup}")
         from core.utils.turn_timer import TurnTimer
 
@@ -187,86 +246,36 @@ class WakeupSessionManager:
             self.on_wakeup()
 
     async def _start_openclaw_conversation(self, wake_position: int | None = None):
-        """Start an OpenClaw continuous conversation session.
-
-        This runs independently of the XiaoZhi session state machine.
-        KWS is paused during the conversation and resumed when done.
-        """
         from core.openclaw_conversation import OpenClawConversationController
 
-        kws = get_kws()
-        if kws:
-            kws.pause()
-        try:
-            self._openclaw_controller = OpenClawConversationController()
-            self._openclaw_task = asyncio.create_task(
-                self._openclaw_controller.start(wake_position=wake_position)
-            )
-            await self._openclaw_task
-        except asyncio.CancelledError:
-            pass  # interrupted cleanly by on_interrupt
-        except Exception as exc:
-            logger.error(
-                f"[Wakeup] OpenClaw conversation failed: {type(exc).__name__}: {exc}",
-                module="Wakeup",
-            )
-        finally:
-            self._openclaw_controller = None
-            self._openclaw_task = None
-            if kws:
-                kws.resume()
+        await self._start_external_conversation("openclaw", OpenClawConversationController, wake_position)
 
     async def _start_openai_conversation(self, wake_position: int | None = None):
-        """Start an OpenAI-compatible continuous conversation session."""
         from core.openai_conversation import OpenAIConversationController
 
-        kws = get_kws()
-        if kws:
-            kws.pause()
-        try:
-            self._openai_controller = OpenAIConversationController()
-            self._openai_task = asyncio.create_task(
-                self._openai_controller.start(wake_position=wake_position)
-            )
-            await self._openai_task
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.error(
-                f"[Wakeup] OpenAI conversation failed: {type(exc).__name__}: {exc}",
-                module="Wakeup",
-            )
-        finally:
-            self._openai_controller = None
-            self._openai_task = None
-            if kws:
-                kws.resume()
+        await self._start_external_conversation("openai", OpenAIConversationController, wake_position)
 
     async def _start_qwenpaw_conversation(self, wake_position: int | None = None):
-        """Start a QwenPaw continuous conversation session."""
         from core.qwenpaw_conversation import QwenPawConversationController
 
-        kws = get_kws()
-        if kws:
-            kws.pause()
+        await self._start_external_conversation("qwenpaw", QwenPawConversationController, wake_position)
+
+    async def _start_external_conversation(self, name, controller_type, wake_position):
+        """唤醒拥有者等待整个会话结束；旧任务只能清理自己持有的引用。"""
+        controller = controller_type()
+        task = asyncio.create_task(controller.start(wake_position=wake_position))
+        setattr(self, f"_{name}_controller", controller)
+        setattr(self, f"_{name}_task", task)
         try:
-            self._qwenpaw_controller = QwenPawConversationController()
-            self._qwenpaw_task = asyncio.create_task(
-                self._qwenpaw_controller.start(wake_position=wake_position)
-            )
-            await self._qwenpaw_task
+            await task
         except asyncio.CancelledError:
-            pass
+            raise
         except Exception as exc:
-            logger.error(
-                f"[Wakeup] QwenPaw conversation failed: {type(exc).__name__}: {exc}",
-                module="Wakeup",
-            )
+            logger.error(f"[Wakeup] {name} conversation failed: {type(exc).__name__}: {exc}")
         finally:
-            self._qwenpaw_controller = None
-            self._qwenpaw_task = None
-            if kws:
-                kws.resume()
+            if getattr(self, f"_{name}_task") is task:
+                setattr(self, f"_{name}_controller", None)
+                setattr(self, f"_{name}_task", None)
 
     async def reset_all_sessions(self):
         """Reset all active sessions before starting a new one.
@@ -288,13 +297,8 @@ class WakeupSessionManager:
             except Exception:
                 pass
 
-        # Stop OpenClaw continuous conversation (also stops its TTS stream)
-        if self._openclaw_controller and self._openclaw_controller.is_active():
-            self._openclaw_controller.stop()
-        if self._openai_controller and self._openai_controller.is_active():
-            self._openai_controller.stop()
-        if self._qwenpaw_controller and self._qwenpaw_controller.is_active():
-            self._qwenpaw_controller.stop()
+        # 停止标志不能中断正在等待的 TTS / HTTP，必须取消并等旧任务完成。
+        await self._stop_external_sessions()
 
         # Stop all audio playback on the device
         await self._stop_device_playback()

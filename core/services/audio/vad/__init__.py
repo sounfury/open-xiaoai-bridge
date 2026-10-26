@@ -5,6 +5,7 @@ from core.ref import get_xiaoai, set_vad
 from core.services.audio.stream import GlobalStream, MyAudio
 from core.services.audio.vad.silero import Silero
 from core.services.protocols.typing import AudioConfig
+from core.services.diagnostics import diagnostics
 from core.utils.config import ConfigManager
 from core.utils.logger import logger
 from core.wakeup_session import EventManager
@@ -62,19 +63,21 @@ class _VAD:
 
     def _reset_state(self):
         """重置状态"""
+        diagnostics.event("vad.reset", target=self.target, paused=self.paused,
+                          discarded_speech_s=round(len(self.speech_frames) / 32000, 3))
         self.speech_count = 0
         self.silence_count = 0
         self.speech_frames = []
         self.silence_frames = []
 
     def start(self):
-        """启动VAD检测器"""
-        logger.vad_event("语音活动检测服务启动", f"最小语音时长={self.min_speech_duration}ms, 最小静音时长={self.min_silence_duration}ms, 阈值={self.threshold}")
-        
+        """初始化 VAD 线程，等待会话通过 resume() 指定检测目标。"""
+        logger.vad_event("语音活动检测服务就绪（待命）", f"最小语音时长={self.min_speech_duration}ms, 最小静音时长={self.min_silence_duration}ms, 阈值={self.threshold}")
+
         self._initialize_audio_stream()
 
-        # 启动检测线程
-        self.paused = False
+        # 空闲时只运行独立的 KWS；无目标 VAD 会无限积累环境人声，拖慢全部音频线程。
+        self.paused = True
         self.thread = threading.Thread(target=self._detection_loop, daemon=True)
         self.thread.start()
 
@@ -97,6 +100,8 @@ class _VAD:
         preroll_from: 只在 target="speech" 时有效。[preroll_from, replay_from 或现在) 之间的音频
             不做检测，作为"开口前的静音片段"放在语音开头（补上唤醒词末尾一点，识别更稳）。
         """
+        if target not in ("speech", "silence"):
+            raise ValueError(f"未知的 VAD 检测目标: {target!r}")
         speech_end, self._speech_end = self._speech_end, None
         if target == "speech":
             # 新的一轮监听从干净的 Silero 状态开始；"silence" 是同一句话的后半段，状态保留。
@@ -139,20 +144,16 @@ class _VAD:
         self.speech_count += len(frames) // 2
         self.silence_count = 0
 
-        if self.target == "speech":
-            if not self.speech_frames:
-                # 加入静音片段（潜在的语音片段）
-                self.speech_frames.extend(self.silence_frames)
-
-        # 加入语音片段
+        # 只有开口检测需要保存预录；等停顿时，完整录音由会话层或小智 codec 接收。
+        if self.target != "speech":
+            return
+        if not self.speech_frames:
+            self.speech_frames.extend(self.silence_frames)
         self.speech_frames.extend(frames)
 
-        speech_bytes = bytes(self.speech_frames)
-
-        if (
-            self.target == "speech"
-            and self.speech_count > self.min_speech_duration * self.sample_rate / 1000
-        ):
+        if self.speech_count > self.min_speech_duration * self.sample_rate / 1000:
+            # 只在真正派发时转换一次，不能每帧都复制持续增长的历史。
+            speech_bytes = bytes(self.speech_frames)
             self._speech_end = self.stream.position()
             self.pause()
             EventManager.on_speech(speech_bytes)
@@ -196,7 +197,7 @@ class _VAD:
                 rate=self.sample_rate,
                 input=True,
                 frames_per_buffer=self.frame_size,
-                start=True,
+                start=False,  # resume() 才订阅 GlobalStream，空闲时连输入队列也不积累
             )
             return True
         except Exception:
@@ -231,14 +232,18 @@ class _VAD:
                 time.sleep(0.01)
                 continue
 
-            # 检测是否是语音（回放历史时按这一帧原来的位置判断是否还在回声残留期）
-            position = self.stream.position() - self.frame_size
-            speech_prob = Silero.vad(frames, self.sample_rate) or 0
-            is_speech = speech_prob >= self._speech_threshold(position)
-            if is_speech:
-                self._handle_speech_frame(frames)
-            else:
-                self._handle_silence_frame(frames)
+            # 检测、历史维护分别计时，定位模型推理慢还是缓冲复制慢。
+            with diagnostics.measure("vad.frame", audio_s=self.frame_size / self.sample_rate, warn_s=0.1):
+                position = self.stream.position() - self.frame_size
+                with diagnostics.measure("vad.inference"):
+                    speech_prob = Silero.vad(frames, self.sample_rate) or 0
+                is_speech = speech_prob >= self._speech_threshold(position)
+                diagnostics.count("vad.speech_frames" if is_speech else "vad.silence_frames")
+                with diagnostics.measure("vad.handle_speech" if is_speech else "vad.handle_silence"):
+                    if is_speech:
+                        self._handle_speech_frame(frames)
+                    else:
+                        self._handle_silence_frame(frames)
 
             # 回放历史时缓冲区里还有积压，先追上再休息
             if self.stream.unread_samples() < self.frame_size:

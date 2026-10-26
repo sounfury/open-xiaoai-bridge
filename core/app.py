@@ -28,6 +28,7 @@ from core.openai import OpenAIManager
 from core.qwenpaw import QwenPawManager
 from core.muse import is_muse_enabled
 from core.services.api_server import APIServer
+from core.services.diagnostics import diagnostics
 
 
 class MainApp:
@@ -284,6 +285,7 @@ class MainApp:
     def _run_event_loop(self):
         """Run asyncio event loop in separate thread."""
         asyncio.set_event_loop(self.loop)
+        diagnostics.start()
         self.loop.run_forever()
 
     def _start_config_watcher(self):
@@ -384,6 +386,7 @@ class MainApp:
     def shutdown(self):
         """Shutdown the application."""
         self.shutdown_requested = True
+        diagnostics.stop()
         self.running = False
 
         if self.xiaozhi:

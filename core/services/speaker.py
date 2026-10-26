@@ -5,6 +5,7 @@ from typing import Literal
 import open_xiaoai_server
 
 from core.ref import get_xiaoai, set_speaker
+from core.services.diagnostics import diagnostics
 from core.utils.base import json_decode, json_encode
 from core.utils.logger import logger
 
@@ -120,10 +121,12 @@ class SpeakerManager:
         aplay 不立即重启，由 Rust 侧 ensure_player_ready() 在首次
         发送音频数据时按需启动，避免空 buffer 导致 underrun。
         """
-        await self.run_shell(
-            "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
-        )
-        await open_xiaoai_server.stop_playing()
+        with diagnostics.measure("stop_device.shell", warn_s=1):
+            await self.run_shell(
+                "killall tts_play.sh miplayer 2>/dev/null; mphelper pause"
+            )
+        with diagnostics.measure("stop_device.pcm", warn_s=1):
+            await open_xiaoai_server.stop_playing()
 
     async def wake_up(self, awake=True, silent=True):
         """
@@ -225,14 +228,28 @@ class SpeakerManager:
             timeout: 超时时间（毫秒）
         """
         res = "unknown"
+        # 只记录有限的命令类别，不把 TTS 文本、令牌或完整 shell 写入诊断日志。
+        word = script.strip().split(maxsplit=1)[0] if script.strip() else "other"
+        kind = "tts" if word == "/usr/sbin/tts_play.sh" else (
+            word if word in {"ubus", "miplayer", "killall", "mphelper"} else "other"
+        )
         try:
-            res = await get_xiaoai().run_shell(script, timeout=timeout)
+            with diagnostics.measure(f"rpc.shell.{kind}", warn_s=None if kind in {"tts", "miplayer"} else 1):
+                res = await get_xiaoai().run_shell(script, timeout=timeout)
             data = json_decode(res)
             if data:
+                exit_code = data.get("exit_code", 0)
+                if exit_code:
+                    diagnostics.event("rpc.shell.nonzero", kind=kind, exit_code=exit_code)
                 return CommandResult(
                     data.get("stdout", ""),
                     data.get("stderr", ""),
-                    data.get("exit_code", 0),
+                    exit_code,
                 )
-        except Exception:
+            diagnostics.event("rpc.shell.empty_response", kind=kind)
+        except asyncio.CancelledError:
+            diagnostics.event("rpc.shell.cancelled", kind=kind, timeout_ms=timeout)
+            raise
+        except Exception as exc:
+            diagnostics.event("rpc.shell.error", kind=kind, timeout_ms=timeout, error_type=type(exc).__name__)
             return CommandResult("error", res, -1)

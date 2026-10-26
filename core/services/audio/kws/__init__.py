@@ -4,12 +4,13 @@ import asyncio
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import CancelledError, ThreadPoolExecutor
 
 from core.ref import get_app, get_xiaoai, get_xiaozhi, set_kws
 from core.services.audio.kws.detector import FRAME_SAMPLES, KeywordDetector
 from core.services.audio.kws.sherpa import SherpaOnnx, spotter_settings
 from core.services.audio.stream import MyAudio
+from core.services.diagnostics import diagnostics
 from core.services.audio.vad.silero import create_silero
 from core.services.protocols.typing import AudioConfig, DeviceState
 from core.utils.config import ConfigManager
@@ -126,6 +127,7 @@ class _KWS:
         self._pool = ThreadPoolExecutor(max_workers=len(self.extra_detectors), thread_name_prefix="kws-mic")
 
     def _reset_detectors(self):
+        diagnostics.count("kws.resets")
         self.detector.reset()
         for detector in self.extra_detectors.values():
             detector.reset()
@@ -159,6 +161,7 @@ class _KWS:
         """命中唤醒词：播报中打断时交给打断处理，否则按普通唤醒派发。"""
         # 唤醒词大约在已读到的位置结束（GlobalStream 绝对采样位置）
         position = self.stream.position()
+        diagnostics.event("kws.hit", position=position, queued_ms=round(self.stream.unread_samples() / 16, 1))
         handler = getattr(self, "_barge_in_handler", None)
         # 耗时从这里算起；KWS 落后 = 已收到但还没过检测的音频
         TurnTimer.begin(
@@ -177,14 +180,18 @@ class _KWS:
         """普通唤醒；position 让对话从唤醒词后面接着听（"你好缪斯，开灯"）。"""
         loop = get_app().loop if get_app() else get_xiaoai().async_loop
         logger.debug(f"[KWS] Dispatch wakeup event: {text}")
+        # 派发前立即占住唤醒入口，主循环暂时繁忙时也不能继续积压唤醒请求。
+        self.pause()
         future = asyncio.run_coroutine_threadsafe(
-            EventManager.wakeup(text, "kws", position=position),
+            EventManager.wakeup(text, "kws", position=position, detected_at=time.monotonic()),
             loop,
         )
 
         def _log_result(done_future):
             try:
                 done_future.result()
+            except CancelledError:
+                pass
             except Exception as exc:
                 logger.error(f"[KWS] Wakeup dispatch failed: {type(exc).__name__}: {exc}")
 
@@ -193,12 +200,13 @@ class _KWS:
     # ===== 私有方法 =====
 
     @staticmethod
-    def _process_chunks(detector: KeywordDetector, chunks: list[bytes]) -> str | None:
+    def _process_chunks(detector: KeywordDetector, chunks: list[bytes], name: str) -> str | None:
         """同一路的几帧按顺序处理，返回第一个命中。"""
-        for chunk in chunks:
-            result = detector.process(chunk)
-            if result:
-                return result
+        with diagnostics.measure(f"kws.{name}", audio_s=sum(map(len, chunks)) / 32000, warn_s=0.2):
+            for chunk in chunks:
+                result = detector.process(chunk)
+                if result:
+                    return result
         return None
 
     def _on_config_reload(self, *_args):
@@ -208,7 +216,15 @@ class _KWS:
     def _detection_loop(self):
         self.stream.start_stream()
         while True:
-            # 读取缓冲区音频数据（ch0 单声道 + 多麦各路）
+            # 实时唤醒不补做数秒前的检测；丢旧帧后重置模型，避免拼接出旧唤醒词。
+            dropped = self.stream.trim_input(self.sample_rate, self.sample_rate // 3)
+            if dropped:
+                diagnostics.count("kws.dropped_samples", dropped)
+                diagnostics.event("kws.trim", dropped_ms=round(dropped * 1000 / self.sample_rate))
+                logger.warning(f"[KWS] 主麦音频积压，丢弃 {dropped * 1000 // self.sample_rate}ms，恢复实时检测")
+                self._reset_detectors()
+                self._skipped = True
+            # 读取缓冲区音频数据（ch0 单声道 + 多麦各路，每路只取一帧）
             frames = self.stream.read(self.frame_size)
             mono_ready = len(frames) == self.frame_size * 2
             extra = self.multimic.pull() if self.multimic is not None else []
@@ -243,23 +259,28 @@ class _KWS:
                 if name in self.extra_detectors:
                     chunks.setdefault(name, []).append(chunk)
             futures = [
-                (name, self._pool.submit(self._process_chunks, self.extra_detectors[name], items))
+                (name, self._pool.submit(self._process_chunks, self.extra_detectors[name], items, name))
                 for name, items in chunks.items()
             ]
             hits: list[tuple[str, str]] = []
             if mono_ready:
-                result = self.detector.process(frames)
+                result = self._process_chunks(self.detector, [frames], "ch0")
                 if result:
                     hits.append(("ch0", result))
             for name, future in futures:
                 try:
-                    result = future.result()
+                    with diagnostics.measure(f"kws.wait_{name}", warn_s=0.2):
+                        result = future.result()
                 except Exception as exc:
                     logger.error(f"[KWS] {name} 检测失败: {type(exc).__name__}: {exc}")
                     continue
                 if result:
                     hits.append((name, result))
             if not hits:
+                continue
+            if self.stream.unread_samples() > self.sample_rate:
+                # 本帧推理时已落后太多，命中也已过时；下一轮清缓存再检测。
+                diagnostics.count("kws.stale_hits")
                 continue
             now = time.monotonic()
             for name, _ in hits:

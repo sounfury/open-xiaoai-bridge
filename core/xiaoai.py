@@ -10,6 +10,7 @@ import open_xiaoai_server
 
 from core.ref import get_app, get_speaker, set_xiaoai
 from core.services.audio.stream import GlobalStream
+from core.services.diagnostics import diagnostics
 from core.services.speaker import SpeakerManager
 from core.wakeup_session import EventManager
 from core.xiaoai_conversation import XiaoAIConversationController
@@ -180,15 +181,20 @@ class XiaoAI:
         """
         data, metadata = packet
         try:
-            layout = json.loads(metadata).get("layout") if metadata else None
+            details = json.loads(metadata) if metadata else {}
+            layout = details.get("layout")
         except (TypeError, ValueError, AttributeError):
-            layout = None
-        if layout == "mic_ref":
-            frames = np.frombuffer(data, dtype="<i2").reshape(-1, 2)
-            if cls._echo_dump is not None:
-                cls._append_echo_dump(frames)
-            data = cls._cancel_echo(frames)
-        cls.on_input_data(data)
+            details, layout = {}, None
+        diagnostics.input_packet(details)
+        channels = 2 if layout == "mic_ref" else 1
+        with diagnostics.measure("input.packet", audio_s=len(data) / (32000 * channels), warn_s=0.2):
+            if layout == "mic_ref":
+                frames = np.frombuffer(data, dtype="<i2").reshape(-1, 2)
+                if cls._echo_dump is not None:
+                    cls._append_echo_dump(frames)
+                with diagnostics.measure("input.aec", audio_s=len(frames) / 16000):
+                    data = cls._cancel_echo(frames)
+            cls.on_input_data(data)
 
     @classmethod
     def _cancel_echo(cls, frames) -> bytes:
@@ -275,6 +281,7 @@ class XiaoAI:
             log = logger.debug if stalled_logged else logger.warning
             log(f"[XiaoAI] {idle:.0f}s 没有收到录音，重新请求录音")
             stalled_logged = True
+            diagnostics.event("input.watchdog_restart", idle_ms=round(idle * 1000), wanted=cls._recording_wanted)
             asyncio.run_coroutine_threadsafe(cls._restart_recording(), loop)
 
     @staticmethod
@@ -357,7 +364,9 @@ class XiaoAI:
         pcm = audio_array.tobytes()
         if cls._input_dump is not None:
             cls._append_input_dump(pcm)
-        GlobalStream.input(pcm)
+        diagnostics.count("input.delivered_samples", len(pcm) // 2)
+        with diagnostics.measure("input.distribute", audio_s=len(pcm) / 32000, warn_s=0.2):
+            GlobalStream.input(pcm)
 
     @classmethod
     def _setup_input_dump(cls):
