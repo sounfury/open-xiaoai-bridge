@@ -377,7 +377,7 @@ API_SERVER_ENABLE=1 uv run main.py
 - bridge 在跑时不要用 `uv run` / `uv sync`：它会重装项目包，`open_xiaoai_server.pyd` 被占用删不掉，重装中断后 `open_xiaoai_server/__init__.py` 会丢，下次启动报 `no attribute 'register_fn'`。跑脚本直接用 `.venv/Scripts/python.exe`
 - 已经弄坏时：从 `dist-migration/*.whl` 取回 `open_xiaoai_server/__init__.py`（或 `uv pip install --force-reinstall --no-deps` 这个 wheel，需先停 bridge）
 - 重启：结束 `start-bridge.bat` 的 cmd 进程树，再 `schtasks /Run /TN \OpenXiaoAI-Bridge`；日志在 `logs/bridge-autostart.log`
-- 2026-10-27 起 bridge 改在平板（OPPO Pad Mini，SM8845P，KernelSU root，192.168.1.57）上运行，Windows 计划任务已 Disabled；音箱 `/data/open-xiaoai/server.txt` 指向 `ws://192.168.1.57:4399`（原值备份在 `server.txt.pc-bak`）。**同一时间只能有一个 bridge 连音箱**，切回 PC 前先停平板
+- 2026-10-27 起 bridge 改在平板（OPPO Pad Mini，SM8845P，KernelSU root，192.168.1.217）上运行，Windows 计划任务已 Disabled；音箱 `/data/open-xiaoai/server.txt` 指向 `ws://192.168.1.217:4399`（原值备份在 `server.txt.pc-bak`）。光猫（联通 ZXHN G7606V6，192.168.1.1）"基本配置 → LAN配置 → 静态分配客户端配置"已绑定：平板 `c0:2f:cd:a3:e9:df`（Wi‑Fi 用设备 MAC）→ .217，音箱 `50:fe:39:f4:a5:b3` → .73。**同一时间只能有一个 bridge 连音箱**，切回 PC 前先停平板
 
 ### 平板部署（deploy/android-chroot/）
 - Ubuntu 24.04 arm64 chroot 在 `/data/local/ubuntu`，项目在 chroot 内 `/opt/open-xiaoai-bridge`（git archive + 模型 + `.hermes_api_key`，不是 git 仓库）；管理脚本在 Android 侧 `/data/local/ubuntu-tools/`，都要用 `su -M` 跑（挂载进全局命名空间）
