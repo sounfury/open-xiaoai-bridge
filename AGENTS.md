@@ -377,6 +377,17 @@ API_SERVER_ENABLE=1 uv run main.py
 - bridge 在跑时不要用 `uv run` / `uv sync`：它会重装项目包，`open_xiaoai_server.pyd` 被占用删不掉，重装中断后 `open_xiaoai_server/__init__.py` 会丢，下次启动报 `no attribute 'register_fn'`。跑脚本直接用 `.venv/Scripts/python.exe`
 - 已经弄坏时：从 `dist-migration/*.whl` 取回 `open_xiaoai_server/__init__.py`（或 `uv pip install --force-reinstall --no-deps` 这个 wheel，需先停 bridge）
 - 重启：结束 `start-bridge.bat` 的 cmd 进程树，再 `schtasks /Run /TN \OpenXiaoAI-Bridge`；日志在 `logs/bridge-autostart.log`
+- 2026-10-27 起 bridge 改在平板（OPPO Pad Mini，SM8845P，KernelSU root，192.168.1.57）上运行，Windows 计划任务已 Disabled；音箱 `/data/open-xiaoai/server.txt` 指向 `ws://192.168.1.57:4399`（原值备份在 `server.txt.pc-bak`）。**同一时间只能有一个 bridge 连音箱**，切回 PC 前先停平板
+
+### 平板部署（deploy/android-chroot/）
+- Ubuntu 24.04 arm64 chroot 在 `/data/local/ubuntu`，项目在 chroot 内 `/opt/open-xiaoai-bridge`（git archive + 模型 + `.hermes_api_key`，不是 git 仓库）；管理脚本在 Android 侧 `/data/local/ubuntu-tools/`，都要用 `su -M` 跑（挂载进全局命名空间）
+- 运维：`adb shell "su -M -c 'sh /data/local/ubuntu-tools/bridge-ctl.sh status|start|stop|restart|log 50'"`；日志 `/data/local/ubuntu/opt/open-xiaoai-bridge/logs/bridge-autostart.log`，守护日志 `/data/local/ubuntu-tools/run/supervisor.log`
+- 开机自启：`/data/adb/service.d/openxiaoai-bridge.sh`（等 boot_completed + wlan0 有 IP）。守护循环持 wakelock、每 15 秒重设 `iw dev wlan0 set power_save off`、放根 cpuset（0-7 核），bridge 退出按退避重启
+- sherpa-onnx 的 arm64 wheel 不带 ONNX Runtime：需要 `onnxruntime/capi/libonnxruntime.so` 软链 + `LD_LIBRARY_PATH`（`run-bridge.sh` 自动处理）
+- 平板上的 FlClash VPN 会让 chroot 外网走 tun0，Hermes 连接慢且偶发 DNS 失败；保持关闭或让 132.226.76.2 直连
+- Git Bash 调 adb 要 `MSYS_NO_PATHCONV=1`，否则 `/data/...` 被改成 Windows 路径
+- 更新代码：`git archive HEAD` 推到 `/data/local/tmp/xfer/`，在 chroot 里解压覆盖后 `bridge-ctl.sh restart`；依赖变了才在 chroot 里 `uv sync`
+- 性能基准 `scripts/perf_bench.py`（持续说话最坏情况）：平板实时率约 0.52（熄屏 0.56），PC 0.85；SenseVoice 识别 5 秒音频约 105 ms
 
 ### 兼容约束
 - `CLI` 环境变量不再作为功能开关，不要引入依赖 `CLI` 的运行时分支
