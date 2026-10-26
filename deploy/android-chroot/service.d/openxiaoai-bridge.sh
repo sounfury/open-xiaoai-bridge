@@ -14,6 +14,11 @@ echo "$(date '+%F %T') boot: wlan0=$(ip -4 addr show wlan0 | awk '/inet /{print 
 touch /data/local/ubuntu-tools/run/enabled
 sh /data/local/ubuntu-tools/bridge-ctl.sh start >> "$LOG" 2>&1
 
+# SSH（2222，仅密钥）；sshd 自己转后台
+if [ -x /data/local/ubuntu/usr/sbin/sshd ]; then
+  sh /data/local/ubuntu-tools/chroot.sh run "mkdir -p /run/sshd && /usr/sbin/sshd" </dev/null >> "$LOG" 2>&1
+fi
+
 # paseo 守护进程（chroot 内 /root/.paseo，配置由 paseo onboard 生成）；没装就跳过
 if [ -x /data/local/ubuntu/usr/local/bin/paseo ]; then
   sleep 5

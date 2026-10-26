@@ -386,6 +386,7 @@ API_SERVER_ENABLE=1 uv run main.py
 - sherpa-onnx 的 arm64 wheel 不带 ONNX Runtime：需要 `onnxruntime/capi/libonnxruntime.so` 软链 + `LD_LIBRARY_PATH`（`run-bridge.sh` 自动处理）
 - 平板上的 FlClash VPN 会让 chroot 外网走 tun0，Hermes 连接慢且偶发 DNS 失败；保持关闭或让 132.226.76.2 直连
 - chroot 里还装了 Node v24（`/opt/node`）、pi（`@earendil-works/pi-coding-agent`，`/root/.pi/agent/` 用 magpie.oci 的 12 个模型）和 paseo（`@getpaseo/cli`，`/root/.paseo`，监听 127.0.0.1:6767 + relay 配对，开机由 service.d 脚本 `paseo start`）；重装见 `setup-agents.sh`
+- SSH：chroot 内 sshd 监听 2222（仅密钥，`UsePAM no`；`setup-sshd.sh`，开机由 service.d 启动）。PC 上 `ssh tablet`（`~/.ssh/config`，默认用无密码短语的 `~/.ssh/tablet_ed25519`；`id_ed25519` 有密码短语，BatchMode 用不了）。SSH 进来是在 chroot 里，碰不到 Android 侧的 `bridge-ctl.sh`；要重启 bridge 可以 `pkill -INT -f "python main.py"`，守护循环约 3 秒后自动拉起
 - Git Bash 调 adb 要 `MSYS_NO_PATHCONV=1`，否则 `/data/...` 被改成 Windows 路径
 - 更新代码：`git archive HEAD` 推到 `/data/local/tmp/xfer/`，在 chroot 里解压覆盖后 `bridge-ctl.sh restart`；依赖变了才在 chroot 里 `uv sync`
 - 性能基准 `scripts/perf_bench.py`（持续说话最坏情况）：平板实时率约 0.52（熄屏 0.56），PC 0.85；SenseVoice 识别 5 秒音频约 105 ms
